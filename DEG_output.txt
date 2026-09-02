@@ -1,0 +1,827 @@
+############################################################
+## 鼻咽癌：按模块整理 L/R 差异基因交集
+##
+## 每个模块：
+## L_union = L_Hotspot_vs_Near(p<0.05) ∪ L_Near_vs_Far(p<0.05)
+## R_union = R_Hotspot_vs_Near(p<0.05) ∪ R_Near_vs_Far(p<0.05)
+## final   = L_union ∩ R_union
+##
+## 输出：
+## /media/desk16/iy2142/鼻咽癌课题/给汪汪差异基因整理
+############################################################
+
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+set.seed(123)
+
+############################################################
+## 0. 路径
+############################################################
+
+SEARCH_ROOTS <- c(
+  "/media/desk16/iy2142/鼻咽癌课题/02_Hotspot",
+  "/media/desk16/iy2142/鼻咽癌课题/03_xCell_marker_hotspot_distance"
+)
+
+OUTDIR <- "/media/desk16/iy2142/鼻咽癌课题/给汪汪差异基因整理"
+
+DIR_SUMMARY <- file.path(OUTDIR, "00_summary")
+DIR_MODULE  <- file.path(OUTDIR, "01_modules")
+DIR_EXCEL   <- file.path(OUTDIR, "02_excel")
+DIR_RDS     <- file.path(OUTDIR, "03_Robject")
+
+dir.create(OUTDIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_SUMMARY, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_MODULE, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_EXCEL, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_RDS, recursive = TRUE, showWarnings = FALSE)
+
+############################################################
+## 1. 参数
+############################################################
+
+P_CUTOFF <- 0.05
+
+COMPARISON_ORDER <- c("Hotspot_vs_Near", "Near_vs_Far")
+SECTION_ORDER <- c("L", "R")
+
+CLEAR_OLD_OUTPUT <- TRUE
+
+############################################################
+## 2. 清理旧输出
+############################################################
+
+if (CLEAR_OLD_OUTPUT) {
+  old_files <- list.files(
+    OUTDIR,
+    pattern = "\\.(csv|xlsx|rds|txt)$",
+    recursive = TRUE,
+    full.names = TRUE
+  )
+  
+  if (length(old_files) > 0) {
+    unlink(old_files)
+    message("已删除旧输出文件数量：", length(old_files))
+  }
+}
+
+############################################################
+## 3. 加载包
+############################################################
+
+need_pkgs <- c(
+  "dplyr",
+  "tidyr",
+  "stringr",
+  "openxlsx"
+)
+
+for (p in need_pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    stop("缺少 R 包：", p, "。请先安装。")
+  }
+}
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(openxlsx)
+})
+
+############################################################
+## 4. 工具函数
+############################################################
+
+find_first_col <- function(df, candidates, required = TRUE, desc = "") {
+  hit <- candidates[candidates %in% colnames(df)]
+  
+  if (length(hit) == 0) {
+    if (required) {
+      stop(
+        "缺少必要列：",
+        desc,
+        "\n候选列名：",
+        paste(candidates, collapse = ", "),
+        "\n当前列名：",
+        paste(colnames(df), collapse = ", ")
+      )
+    } else {
+      return(NA_character_)
+    }
+  }
+  
+  hit[1]
+}
+
+clean_gene <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x <- gsub("\\..*$", "", x)
+  x <- toupper(x)
+  x[x %in% c("", "NA", "NAN", "NULL")] <- NA_character_
+  x
+}
+
+make_safe_name <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x <- gsub("[\r\n\t]+", " ", x)
+  x <- gsub("\\s+", "_", x)
+  x <- gsub("[/\\\\:*?\"<>|]", "_", x, perl = TRUE)
+  x <- gsub("_+", "_", x)
+  x <- gsub("^_|_$", "", x)
+  ifelse(is.na(x) | x == "", "module", x)
+}
+
+safe_sheet <- function(x) {
+  x <- as.character(x)
+  x <- gsub("[\\[\\]\\*\\?/\\\\:]", "_", x)
+  x <- gsub("^'|'$", "", x)
+  x <- substr(x, 1, 31)
+  ifelse(x == "", "sheet", x)
+}
+
+derive_direction <- function(comparison, avg_diff) {
+  comparison <- as.character(comparison)
+  avg_diff <- as.numeric(avg_diff)
+  
+  dplyr::case_when(
+    comparison == "Hotspot_vs_Near" & is.finite(avg_diff) & avg_diff > 0 ~ "Hotspot_up",
+    comparison == "Hotspot_vs_Near" & is.finite(avg_diff) & avg_diff < 0 ~ "Near_up",
+    comparison == "Near_vs_Far" & is.finite(avg_diff) & avg_diff > 0 ~ "Near_up",
+    comparison == "Near_vs_Far" & is.finite(avg_diff) & avg_diff < 0 ~ "Far_up",
+    TRUE ~ "unknown"
+  )
+}
+
+parse_comparison <- function(file) {
+  bn <- basename(file)
+  
+  dplyr::case_when(
+    grepl("Hotspot_vs_Near", bn, ignore.case = TRUE) ~ "Hotspot_vs_Near",
+    grepl("Near_vs_Far", bn, ignore.case = TRUE) ~ "Near_vs_Far",
+    TRUE ~ NA_character_
+  )
+}
+
+parse_section <- function(file) {
+  bn <- basename(file)
+  
+  dplyr::case_when(
+    grepl("_DEG_L\\.csv$", bn, ignore.case = TRUE) ~ "L",
+    grepl("_DEG_R\\.csv$", bn, ignore.case = TRUE) ~ "R",
+    grepl("_L\\.csv$", bn, ignore.case = TRUE) & !grepl("LR_combined", bn, ignore.case = TRUE) ~ "L",
+    grepl("_R\\.csv$", bn, ignore.case = TRUE) & !grepl("LR_combined", bn, ignore.case = TRUE) ~ "R",
+    TRUE ~ NA_character_
+  )
+}
+
+parse_module_from_path <- function(file) {
+  ## 典型结构：
+  ## <root>/<module>/01_tables/06_xxx_DEG_L.csv
+  parent1 <- basename(dirname(file))
+  parent2 <- basename(dirname(dirname(file)))
+  
+  if (parent1 == "01_tables") {
+    return(parent2)
+  }
+  
+  parent2
+}
+
+pick_best_record <- function(df) {
+  if (nrow(df) == 0) return(df)
+  
+  df %>%
+    dplyr::arrange(p_value, p_adj_BH, dplyr::desc(abs(avg_diff))) %>%
+    dplyr::slice(1)
+}
+
+############################################################
+## 5. 搜索 DEG 文件
+############################################################
+
+existing_roots <- SEARCH_ROOTS[dir.exists(SEARCH_ROOTS)]
+
+if (length(existing_roots) == 0) {
+  stop(
+    "SEARCH_ROOTS 中没有任何目录存在：\n",
+    paste(SEARCH_ROOTS, collapse = "\n")
+  )
+}
+
+all_csv <- unique(unlist(lapply(existing_roots, function(root) {
+  list.files(
+    root,
+    pattern = "\\.csv$",
+    recursive = TRUE,
+    full.names = TRUE
+  )
+})))
+
+deg_files <- all_csv[
+  grepl("Hotspot_vs_Near|Near_vs_Far", basename(all_csv), ignore.case = TRUE) &
+    grepl("DEG", basename(all_csv), ignore.case = TRUE) &
+    grepl("_(L|R)\\.csv$", basename(all_csv), ignore.case = TRUE) &
+    !grepl("LR_combined|LRcombine|LR_combined", basename(all_csv), ignore.case = TRUE)
+]
+
+if (length(deg_files) == 0) {
+  stop(
+    "没有找到 L/R 的 Hotspot_vs_Near 或 Near_vs_Far DEG 文件。\n",
+    "搜索目录：\n",
+    paste(existing_roots, collapse = "\n")
+  )
+}
+
+file_map <- data.frame(
+  file = deg_files,
+  module_label_raw = vapply(deg_files, parse_module_from_path, character(1)),
+  comparison = vapply(deg_files, parse_comparison, character(1)),
+  section = vapply(deg_files, parse_section, character(1)),
+  stringsAsFactors = FALSE
+) %>%
+  dplyr::filter(
+    !is.na(module_label_raw),
+    !is.na(comparison),
+    !is.na(section),
+    comparison %in% COMPARISON_ORDER,
+    section %in% SECTION_ORDER
+  ) %>%
+  dplyr::arrange(module_label_raw, section, comparison, file)
+
+write.csv(
+  file_map,
+  file.path(DIR_SUMMARY, "00_DEG_files_found_and_used.csv"),
+  row.names = FALSE
+)
+
+message("找到 DEG 文件数量：", nrow(file_map))
+print(file_map[, c("module_label_raw", "section", "comparison", "file")])
+
+if (nrow(file_map) == 0) {
+  stop("DEG 文件解析后为空，请检查文件命名。")
+}
+
+############################################################
+## 6. 读取单个 DEG 文件
+############################################################
+
+read_one_deg <- function(file, module_label, section, comparison) {
+  
+  df <- read.csv(
+    file,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+  
+  gene_col <- find_first_col(
+    df,
+    c("gene", "Gene", "genes", "SYMBOL", "symbol"),
+    required = TRUE,
+    desc = "gene"
+  )
+  
+  p_col <- find_first_col(
+    df,
+    c("p_wilcox", "p_value", "pvalue", "p_val", "p", "P.Value", "p.value"),
+    required = TRUE,
+    desc = "p value"
+  )
+  
+  padj_col <- find_first_col(
+    df,
+    c("p_adj_BH", "p.adjust", "p_adj", "padj", "FDR", "fdr", "adj.P.Val"),
+    required = FALSE
+  )
+  
+  avg_col <- find_first_col(
+    df,
+    c(
+      "avg_diff_group_a_minus_group_b",
+      "avg_diff_near_minus_far",
+      "avg_diff",
+      "avg_log2FC",
+      "logFC",
+      "log2FC",
+      "diff"
+    ),
+    required = FALSE
+  )
+  
+  dir_col <- find_first_col(
+    df,
+    c("direction", "trend", "Direction", "regulation"),
+    required = FALSE
+  )
+  
+  out <- df %>%
+    dplyr::mutate(
+      module_label = module_label,
+      section = section,
+      comparison = comparison,
+      gene = clean_gene(.data[[gene_col]]),
+      p_value = as.numeric(.data[[p_col]]),
+      p_col_used = p_col,
+      p_adj_BH = if (!is.na(padj_col)) as.numeric(.data[[padj_col]]) else NA_real_,
+      avg_diff = if (!is.na(avg_col)) as.numeric(.data[[avg_col]]) else NA_real_,
+      direction_from_file = if (!is.na(dir_col)) as.character(.data[[dir_col]]) else NA_character_,
+      direction_by_avgdiff = derive_direction(comparison, avg_diff),
+      source_file = file
+    ) %>%
+    dplyr::filter(
+      !is.na(gene),
+      gene != "",
+      is.finite(p_value)
+    ) %>%
+    dplyr::select(
+      module_label,
+      section,
+      comparison,
+      gene,
+      p_value,
+      p_col_used,
+      p_adj_BH,
+      avg_diff,
+      direction_by_avgdiff,
+      direction_from_file,
+      source_file,
+      dplyr::everything()
+    )
+  
+  out
+}
+
+############################################################
+## 7. 读取所有 DEG，并筛选 p < 0.05
+############################################################
+
+deg_all <- dplyr::bind_rows(lapply(seq_len(nrow(file_map)), function(i) {
+  read_one_deg(
+    file = file_map$file[i],
+    module_label = file_map$module_label_raw[i],
+    section = file_map$section[i],
+    comparison = file_map$comparison[i]
+  )
+}))
+
+deg_sig <- deg_all %>%
+  dplyr::filter(p_value < P_CUTOFF) %>%
+  dplyr::distinct(
+    module_label,
+    section,
+    comparison,
+    gene,
+    .keep_all = TRUE
+  )
+
+write.csv(
+  deg_all,
+  file.path(DIR_SUMMARY, "01_all_DEG_records_raw_L_R_two_comparisons.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  deg_sig,
+  file.path(DIR_SUMMARY, "02_all_DEG_records_p005_L_R_two_comparisons.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## 8. 单模块整理函数
+############################################################
+
+summarise_source_by_gene <- function(sig_df) {
+  
+  if (nrow(sig_df) == 0) {
+    return(data.frame())
+  }
+  
+  best_df <- sig_df %>%
+    dplyr::group_by(gene, section, comparison) %>%
+    dplyr::group_modify(~ pick_best_record(.x)) %>%
+    dplyr::ungroup()
+  
+  presence <- best_df %>%
+    dplyr::mutate(
+      presence_key = paste(section, comparison, "sig", sep = "_"),
+      present = TRUE
+    ) %>%
+    dplyr::select(gene, presence_key, present) %>%
+    tidyr::pivot_wider(
+      names_from = presence_key,
+      values_from = present,
+      values_fill = FALSE
+    )
+  
+  p_wide <- best_df %>%
+    dplyr::mutate(stat_key = paste(section, comparison, "p", sep = "_")) %>%
+    dplyr::select(gene, stat_key, p_value) %>%
+    tidyr::pivot_wider(
+      names_from = stat_key,
+      values_from = p_value
+    )
+  
+  padj_wide <- best_df %>%
+    dplyr::mutate(stat_key = paste(section, comparison, "padj", sep = "_")) %>%
+    dplyr::select(gene, stat_key, p_adj_BH) %>%
+    tidyr::pivot_wider(
+      names_from = stat_key,
+      values_from = p_adj_BH
+    )
+  
+  avg_wide <- best_df %>%
+    dplyr::mutate(stat_key = paste(section, comparison, "avg_diff", sep = "_")) %>%
+    dplyr::select(gene, stat_key, avg_diff) %>%
+    tidyr::pivot_wider(
+      names_from = stat_key,
+      values_from = avg_diff
+    )
+  
+  dir_wide <- best_df %>%
+    dplyr::mutate(stat_key = paste(section, comparison, "direction", sep = "_")) %>%
+    dplyr::select(gene, stat_key, direction_by_avgdiff) %>%
+    tidyr::pivot_wider(
+      names_from = stat_key,
+      values_from = direction_by_avgdiff
+    )
+  
+  section_summary <- best_df %>%
+    dplyr::group_by(gene, section) %>%
+    dplyr::summarise(
+      source_comparisons = paste(unique(comparison), collapse = ";"),
+      n_source_comparisons = dplyr::n_distinct(comparison),
+      min_p_value = min(p_value, na.rm = TRUE),
+      directions = paste(unique(direction_by_avgdiff), collapse = ";"),
+      .groups = "drop"
+    ) %>%
+    tidyr::pivot_wider(
+      id_cols = gene,
+      names_from = section,
+      values_from = c(
+        source_comparisons,
+        n_source_comparisons,
+        min_p_value,
+        directions
+      ),
+      names_glue = "{section}_{.value}"
+    )
+  
+  out <- presence %>%
+    dplyr::full_join(p_wide, by = "gene") %>%
+    dplyr::full_join(padj_wide, by = "gene") %>%
+    dplyr::full_join(avg_wide, by = "gene") %>%
+    dplyr::full_join(dir_wide, by = "gene") %>%
+    dplyr::full_join(section_summary, by = "gene")
+  
+  needed_presence <- c(
+    "L_Hotspot_vs_Near_sig",
+    "L_Near_vs_Far_sig",
+    "R_Hotspot_vs_Near_sig",
+    "R_Near_vs_Far_sig"
+  )
+  
+  for (cc in needed_presence) {
+    if (!cc %in% colnames(out)) {
+      out[[cc]] <- FALSE
+    }
+  }
+  
+  out %>%
+    dplyr::mutate(
+      L_any_sig = L_Hotspot_vs_Near_sig | L_Near_vs_Far_sig,
+      R_any_sig = R_Hotspot_vs_Near_sig | R_Near_vs_Far_sig
+    )
+}
+
+run_one_module <- function(module_label) {
+  
+  message("============================================================")
+  message("整理模块：", module_label)
+  message("============================================================")
+  
+  module_dir_name <- make_safe_name(module_label)
+  out_module_dir <- file.path(DIR_MODULE, module_dir_name)
+  out_tab <- file.path(out_module_dir, "01_tables")
+  out_txt <- file.path(out_module_dir, "02_gene_lists_txt")
+  out_xlsx <- file.path(out_module_dir, "03_excel")
+  
+  dir.create(out_module_dir, recursive = TRUE, showWarnings = FALSE)
+  dir.create(out_tab, recursive = TRUE, showWarnings = FALSE)
+  dir.create(out_txt, recursive = TRUE, showWarnings = FALSE)
+  dir.create(out_xlsx, recursive = TRUE, showWarnings = FALSE)
+  
+  sig_m <- deg_sig %>%
+    dplyr::filter(module_label == !!module_label)
+  
+  all_m <- deg_all %>%
+    dplyr::filter(module_label == !!module_label)
+  
+  L_union <- sig_m %>%
+    dplyr::filter(section == "L") %>%
+    dplyr::pull(gene) %>%
+    unique() %>%
+    sort()
+  
+  R_union <- sig_m %>%
+    dplyr::filter(section == "R") %>%
+    dplyr::pull(gene) %>%
+    unique() %>%
+    sort()
+  
+  LR_intersection <- intersect(L_union, R_union) %>%
+    sort()
+  
+  source_detail_all <- summarise_source_by_gene(sig_m)
+  
+  L_union_df <- source_detail_all %>%
+    dplyr::filter(gene %in% L_union) %>%
+    dplyr::arrange(gene)
+  
+  R_union_df <- source_detail_all %>%
+    dplyr::filter(gene %in% R_union) %>%
+    dplyr::arrange(gene)
+  
+  intersection_detail <- source_detail_all %>%
+    dplyr::filter(gene %in% LR_intersection) %>%
+    dplyr::mutate(
+      module_label = module_label,
+      gene_rank = dplyr::row_number(),
+      .before = 1
+    ) %>%
+    dplyr::arrange(gene)
+  
+  intersection_simple <- data.frame(
+    module_label = module_label,
+    gene = LR_intersection,
+    stringsAsFactors = FALSE
+  )
+  
+  summary_df <- data.frame(
+    module_label = module_label,
+    module_output_dir = out_module_dir,
+    n_L_Hotspot_vs_Near_p005 = sig_m %>%
+      dplyr::filter(section == "L", comparison == "Hotspot_vs_Near") %>%
+      dplyr::pull(gene) %>%
+      unique() %>%
+      length(),
+    n_L_Near_vs_Far_p005 = sig_m %>%
+      dplyr::filter(section == "L", comparison == "Near_vs_Far") %>%
+      dplyr::pull(gene) %>%
+      unique() %>%
+      length(),
+    n_L_union_p005 = length(L_union),
+    n_R_Hotspot_vs_Near_p005 = sig_m %>%
+      dplyr::filter(section == "R", comparison == "Hotspot_vs_Near") %>%
+      dplyr::pull(gene) %>%
+      unique() %>%
+      length(),
+    n_R_Near_vs_Far_p005 = sig_m %>%
+      dplyr::filter(section == "R", comparison == "Near_vs_Far") %>%
+      dplyr::pull(gene) %>%
+      unique() %>%
+      length(),
+    n_R_union_p005 = length(R_union),
+    n_L_union_intersect_R_union = length(LR_intersection),
+    p_cutoff = P_CUTOFF,
+    stringsAsFactors = FALSE
+  )
+  
+  write.csv(
+    summary_df,
+    file.path(out_tab, "00_module_L_R_union_intersection_summary.csv"),
+    row.names = FALSE
+  )
+  
+  write.csv(
+    L_union_df,
+    file.path(out_tab, "01_L_two_comparisons_union_p005_detail.csv"),
+    row.names = FALSE
+  )
+  
+  write.csv(
+    R_union_df,
+    file.path(out_tab, "02_R_two_comparisons_union_p005_detail.csv"),
+    row.names = FALSE
+  )
+  
+  write.csv(
+    intersection_detail,
+    file.path(out_tab, "03_L_union_intersect_R_union_p005_detail.csv"),
+    row.names = FALSE
+  )
+  
+  write.csv(
+    intersection_simple,
+    file.path(out_tab, "04_L_union_intersect_R_union_p005_gene_list_simple.csv"),
+    row.names = FALSE
+  )
+  
+  write.csv(
+    sig_m,
+    file.path(out_tab, "05_all_source_DEG_records_p005_this_module.csv"),
+    row.names = FALSE
+  )
+  
+  write.csv(
+    all_m,
+    file.path(out_tab, "06_all_source_DEG_records_raw_this_module.csv"),
+    row.names = FALSE
+  )
+  
+  write.table(
+    LR_intersection,
+    file.path(out_txt, "L_union_intersect_R_union_p005_genes.txt"),
+    quote = FALSE,
+    row.names = FALSE,
+    col.names = FALSE
+  )
+  
+  write.table(
+    L_union,
+    file.path(out_txt, "L_two_comparisons_union_p005_genes.txt"),
+    quote = FALSE,
+    row.names = FALSE,
+    col.names = FALSE
+  )
+  
+  write.table(
+    R_union,
+    file.path(out_txt, "R_two_comparisons_union_p005_genes.txt"),
+    quote = FALSE,
+    row.names = FALSE,
+    col.names = FALSE
+  )
+  
+  xlsx_file <- file.path(
+    out_xlsx,
+    paste0(module_dir_name, "_L_R_union_intersection_p005.xlsx")
+  )
+  
+  openxlsx::write.xlsx(
+    list(
+      summary = summary_df,
+      L_union = L_union_df,
+      R_union = R_union_df,
+      LR_intersection = intersection_detail,
+      LR_gene_list = intersection_simple,
+      source_p005 = sig_m
+    ),
+    file = xlsx_file,
+    overwrite = TRUE
+  )
+  
+  message("L union: ", length(L_union))
+  message("R union: ", length(R_union))
+  message("L ∩ R : ", length(LR_intersection))
+  message("输出：", out_module_dir)
+  
+  list(
+    summary = summary_df,
+    L_union = L_union_df,
+    R_union = R_union_df,
+    intersection_detail = intersection_detail,
+    intersection_simple = intersection_simple,
+    source_p005 = sig_m,
+    module_output_dir = out_module_dir
+  )
+}
+
+############################################################
+## 9. 循环所有模块
+############################################################
+
+module_order <- file_map %>%
+  dplyr::distinct(module_label_raw) %>%
+  dplyr::pull(module_label_raw)
+
+res_list <- list()
+
+for (m in module_order) {
+  res_list[[m]] <- run_one_module(m)
+}
+
+all_summary <- dplyr::bind_rows(lapply(res_list, `[[`, "summary"))
+all_intersection_detail <- dplyr::bind_rows(lapply(res_list, `[[`, "intersection_detail"))
+all_intersection_simple <- dplyr::bind_rows(lapply(res_list, `[[`, "intersection_simple"))
+all_source_p005 <- dplyr::bind_rows(lapply(res_list, `[[`, "source_p005"))
+
+write.csv(
+  all_summary,
+  file.path(DIR_SUMMARY, "03_all_modules_L_R_union_intersection_summary.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  all_intersection_detail,
+  file.path(DIR_SUMMARY, "04_all_modules_L_union_intersect_R_union_p005_detail.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  all_intersection_simple,
+  file.path(DIR_SUMMARY, "05_all_modules_L_union_intersect_R_union_p005_gene_list_simple.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  all_source_p005,
+  file.path(DIR_SUMMARY, "06_all_modules_source_DEG_records_p005.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## 10. 每个模块 gene list 单独 txt 汇总
+############################################################
+
+gene_list_dir <- file.path(DIR_SUMMARY, "gene_lists_by_module_txt")
+dir.create(gene_list_dir, recursive = TRUE, showWarnings = FALSE)
+
+for (m in module_order) {
+  genes_m <- all_intersection_simple %>%
+    dplyr::filter(module_label == m) %>%
+    dplyr::pull(gene) %>%
+    unique() %>%
+    sort()
+  
+  write.table(
+    genes_m,
+    file.path(gene_list_dir, paste0(make_safe_name(m), "_LR_intersection_genes_p005.txt")),
+    quote = FALSE,
+    row.names = FALSE,
+    col.names = FALSE
+  )
+}
+
+############################################################
+## 11. 全局 Excel
+############################################################
+
+global_xlsx <- file.path(
+  DIR_EXCEL,
+  "all_modules_L_R_union_intersection_p005_results.xlsx"
+)
+
+excel_list <- list(
+  file_map = file_map,
+  all_summary = all_summary,
+  all_LR_intersection = all_intersection_detail,
+  all_gene_list_simple = all_intersection_simple,
+  all_source_p005 = all_source_p005
+)
+
+names(excel_list) <- safe_sheet(names(excel_list))
+
+openxlsx::write.xlsx(
+  excel_list,
+  file = global_xlsx,
+  overwrite = TRUE
+)
+
+############################################################
+## 12. 保存 RDS 和 sessionInfo
+############################################################
+
+saveRDS(
+  list(
+    parameters = list(
+      SEARCH_ROOTS = SEARCH_ROOTS,
+      OUTDIR = OUTDIR,
+      P_CUTOFF = P_CUTOFF,
+      comparison_logic = "For each module: L_union = L_Hotspot_vs_Near(p<0.05) union L_Near_vs_Far(p<0.05); R_union = R_Hotspot_vs_Near(p<0.05) union R_Near_vs_Far(p<0.05); final = L_union intersect R_union."
+    ),
+    file_map = file_map,
+    deg_all = deg_all,
+    deg_sig = deg_sig,
+    all_summary = all_summary,
+    all_intersection_detail = all_intersection_detail,
+    all_intersection_simple = all_intersection_simple,
+    all_source_p005 = all_source_p005,
+    res_list = res_list
+  ),
+  file.path(DIR_RDS, "all_modules_L_R_union_intersection_p005_result.rds")
+)
+
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(OUTDIR, "sessionInfo_L_R_union_intersection_p005.txt")
+)
+
+############################################################
+## 13. 完成提示
+############################################################
+
+message("============================================================")
+message("完成：按模块整理 L/R 两比较并集后取交集")
+message("输出目录：", OUTDIR)
+message("模块子文件夹：", DIR_MODULE)
+message("汇总目录：", DIR_SUMMARY)
+message("全局 Excel：", global_xlsx)
+message("核心汇总表：")
+message("1) ", file.path(DIR_SUMMARY, "03_all_modules_L_R_union_intersection_summary.csv"))
+message("2) ", file.path(DIR_SUMMARY, "04_all_modules_L_union_intersect_R_union_p005_detail.csv"))
+message("3) ", file.path(DIR_SUMMARY, "05_all_modules_L_union_intersect_R_union_p005_gene_list_simple.csv"))
+message("============================================================")
+
+print(all_summary)

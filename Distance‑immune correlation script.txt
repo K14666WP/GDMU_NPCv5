@@ -1,0 +1,2017 @@
+############################################################
+## 鼻咽癌：不同 apCAF 模块不同距离组下
+## module score 与 Immune/Stromal xCell score 的相关性分析
+##
+## 分析单位：
+## module × circle × distance_group pseudo-bulk
+##
+## 核心问题：
+## Hotspot -> Near -> Middle -> Far 距离增加时，
+## 模块分数与 Immune/Stromal score 的相关性是否变化？
+##
+## 输出：
+## /media/desk16/iy2142/鼻咽癌课题/距离免疫相关性
+############################################################
+
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+set.seed(123)
+
+############################################################
+## 0. 路径
+############################################################
+
+ROOT_XCELL <- "/media/desk16/iy2142/鼻咽癌课题/03_xCell_marker_hotspot_distance"
+
+OUTDIR <- "/media/desk16/iy2142/鼻咽癌课题/距离免疫相关性"
+
+DIR_TAB <- file.path(OUTDIR, "01_tables")
+DIR_FIG <- file.path(OUTDIR, "02_figures")
+DIR_FIG_MODULE <- file.path(DIR_FIG, "01_each_module_lineplot")
+DIR_FIG_HEAT <- file.path(DIR_FIG, "02_heatmap_bubble")
+DIR_XLSX <- file.path(OUTDIR, "03_excel")
+DIR_RDS <- file.path(OUTDIR, "04_Robject")
+
+dir.create(OUTDIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_TAB, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_FIG, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_FIG_MODULE, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_FIG_HEAT, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_XLSX, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_RDS, recursive = TRUE, showWarnings = FALSE)
+
+############################################################
+## 1. 参数
+############################################################
+
+CLEAR_OLD_OUTPUT <- TRUE
+
+GROUP_ORDER <- c("Hotspot", "Near", "Middle", "Far")
+
+FINAL_MODULE_ORDER <- c(
+  "no-senescence apCAF",
+  "pre-senescence apCAF",
+  "senescence apCAF",
+  "ECM senescence apCAF",
+  "SASP senescence apCAF"
+)
+
+PREDICTOR_ORDER <- c("Immune score", "Stromal score")
+
+## 相关性主图使用 Pearson；Spearman 也会输出表格和热图
+MAIN_METHOD <- "Pearson"
+
+## 主图优先使用 LR_combined；如果没有 LR_combined，会自动用所有可用 section pooled
+MAIN_SECTION_PREFER <- "LR_combined"
+
+## 每个 module × distance group 至少多少个 pseudo-sample 才计算相关性
+MIN_N_COR <- 8
+
+## xCell immune/stromal 归并方式：
+## zscore_mean = 每个 xCell 细胞类型先 z-score，再按 immune/stromal 类别取均值
+## raw_mean    = 直接对 xCell 原始分数按类别取均值
+XCELL_SCORE_MODE <- "zscore_mean"
+
+## 只用 64 类细胞类型归并；如果某个模块完全找不到 64 类匹配，可允许使用 ImmuneScore/StromaScore 兜底
+ALLOW_AGGREGATE_FALLBACK <- TRUE
+
+############################################################
+## 2. 清理旧输出
+############################################################
+
+if (CLEAR_OLD_OUTPUT) {
+  old_files <- list.files(
+    OUTDIR,
+    pattern = "\\.(csv|xlsx|rds|txt|pdf|png)$",
+    recursive = TRUE,
+    full.names = TRUE
+  )
+  
+  if (length(old_files) > 0) {
+    unlink(old_files)
+    message("已删除旧输出文件数量：", length(old_files))
+  }
+}
+
+############################################################
+## 3. 加载包
+############################################################
+
+need_pkgs <- c(
+  "dplyr",
+  "tidyr",
+  "ggplot2",
+  "stringr",
+  "openxlsx",
+  "scales",
+  "purrr"
+)
+
+for (p in need_pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    stop("缺少 R 包：", p, "。请先安装。")
+  }
+}
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(stringr)
+  library(openxlsx)
+  library(scales)
+  library(purrr)
+})
+
+############################################################
+## 4. 工具函数
+############################################################
+
+safe_z <- function(x) {
+  x <- as.numeric(x)
+  out <- rep(NA_real_, length(x))
+  ok <- is.finite(x)
+  
+  if (sum(ok) == 0) return(out)
+  
+  if (sum(ok) < 2) {
+    out[ok] <- 0
+    return(out)
+  }
+  
+  m <- mean(x[ok], na.rm = TRUE)
+  s <- stats::sd(x[ok], na.rm = TRUE)
+  
+  if (!is.finite(s) || s == 0) {
+    out[ok] <- 0
+  } else {
+    out[ok] <- (x[ok] - m) / s
+  }
+  
+  out
+}
+
+norm_key <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x <- tolower(x)
+  x <- gsub("[[:space:][:punct:]_\\-]+", "", x, perl = TRUE)
+  x
+}
+
+norm_cell <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x <- tolower(x)
+  x <- gsub("[^a-z0-9]+", "", x, perl = TRUE)
+  x
+}
+
+make_id <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x <- toupper(x)
+  x <- gsub("\\s+", "", x)
+  x <- gsub("^L_", "", x)
+  x <- gsub("^R_", "", x)
+  x <- gsub("^HNAS_", "", x)
+  x <- gsub("^HNAS", "", x)
+  x[x %in% c("", "NA", "NAN", "NULL")] <- NA_character_
+  x
+}
+
+sanitize_filename <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x <- iconv(x, from = "", to = "ASCII//TRANSLIT", sub = "_")
+  x <- gsub("[\r\n\t]+", " ", x)
+  x <- gsub("\\s+", "_", x)
+  x <- gsub("[/\\\\:*?\"<>|]", "_", x, perl = TRUE)
+  x <- gsub("[^A-Za-z0-9_.-]+", "_", x, perl = TRUE)
+  x <- gsub("_+", "_", x)
+  x <- gsub("^[_\\.]+|[_\\.]+$", "", x)
+  ifelse(is.na(x) | x == "", "unknown", x)
+}
+
+normalize_group <- function(x) {
+  y <- tolower(trimws(as.character(x)))
+  y <- gsub("[[:space:]_\\-]+", "", y)
+  
+  dplyr::case_when(
+    y %in% c("hotspot", "hot", "core") ~ "Hotspot",
+    y %in% c("near") ~ "Near",
+    y %in% c("middle", "mid") ~ "Middle",
+    y %in% c("far") ~ "Far",
+    TRUE ~ NA_character_
+  )
+}
+
+normalize_section <- function(x) {
+  y <- as.character(x)
+  k <- norm_key(y)
+  
+  dplyr::case_when(
+    k %in% c("lrcombined", "lr", "combined") ~ "LR_combined",
+    grepl("lrcombined", k) ~ "LR_combined",
+    grepl("combined", k) ~ "LR_combined",
+    k == "l" ~ "L",
+    k == "r" ~ "R",
+    grepl("l$", k) & !grepl("lr|combined", k) ~ "L",
+    grepl("r$", k) & !grepl("lr|combined", k) ~ "R",
+    TRUE ~ y
+  )
+}
+
+find_first_col <- function(df, candidates) {
+  hit <- candidates[candidates %in% colnames(df)]
+  if (length(hit) == 0) return(NA_character_)
+  hit[1]
+}
+
+get_col_or_na <- function(df, col) {
+  if (is.na(col) || !col %in% colnames(df)) {
+    return(rep(NA_character_, nrow(df)))
+  }
+  as.character(df[[col]])
+}
+
+format_p <- function(p) {
+  if (is.na(p) || !is.finite(p)) return("p = NA")
+  if (p < 2.2e-16) return("p < 2.2e-16")
+  if (p < 0.001) return("p < 0.001")
+  paste0("p = ", signif(p, 3))
+}
+
+p_stars <- function(p) {
+  ifelse(
+    is.na(p), "",
+    ifelse(
+      p < 0.001, "***",
+      ifelse(
+        p < 0.01, "**",
+        ifelse(
+          p < 0.05, "*",
+          ifelse(p < 0.1, "†", "")
+        )
+      )
+    )
+  )
+}
+
+theme_pub <- function(base_size = 11) {
+  theme_classic(base_size = base_size) +
+    theme(
+      text = element_text(color = "black"),
+      axis.text = element_text(color = "black"),
+      axis.title = element_text(color = "black"),
+      axis.line = element_line(color = "black", linewidth = 0.35),
+      axis.ticks = element_line(color = "black", linewidth = 0.30),
+      plot.title = element_text(face = "bold", color = "black", size = base_size + 4),
+      plot.subtitle = element_text(color = "grey30", size = base_size),
+      legend.title = element_text(color = "black"),
+      legend.text = element_text(color = "black"),
+      strip.text = element_text(face = "bold", color = "black"),
+      strip.background = element_rect(fill = "grey92", color = "black", linewidth = 0.25),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background = element_rect(fill = "white", color = NA)
+    )
+}
+
+save_pdf_png <- function(p, name, width, height, outdir) {
+  dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+  
+  pdf_file <- file.path(outdir, paste0(name, ".pdf"))
+  png_file <- file.path(outdir, paste0(name, ".png"))
+  
+  ggplot2::ggsave(
+    pdf_file,
+    p,
+    width = width,
+    height = height,
+    bg = "white",
+    limitsize = FALSE
+  )
+  
+  ggplot2::ggsave(
+    png_file,
+    p,
+    width = width,
+    height = height,
+    dpi = 320,
+    bg = "white",
+    limitsize = FALSE
+  )
+  
+  message("[PDF] ", pdf_file)
+  message("[PNG] ", png_file)
+}
+
+module_alias_key <- function(x) {
+  k <- norm_key(x)
+  out <- k
+  
+  out[grepl("otherapcaf", k)] <- "nosenescenceapcaf"
+  out[grepl("nosenescenceapcaf", k)] <- "nosenescenceapcaf"
+  out[grepl("nonsenescenceapcaf", k)] <- "nosenescenceapcaf"
+  
+  out[grepl("presenescenceapcaf", k)] <- "presenescenceapcaf"
+  out[grepl("presenescentapcaf", k)] <- "presenescenceapcaf"
+  out[grepl("presenescence", k)] <- "presenescenceapcaf"
+  out[grepl("presenescent", k)] <- "presenescenceapcaf"
+  
+  out[grepl("ecmsenescenceapcaf", k)] <- "ecmsenescenceapcaf"
+  out[grepl("ecmsenescentapcaf", k)] <- "ecmsenescenceapcaf"
+  
+  out[grepl("saspsenescenceapcaf", k)] <- "saspsenescenceapcaf"
+  out[grepl("saspsenescentapcaf", k)] <- "saspsenescenceapcaf"
+  
+  out[k %in% c("senescenceapcaf", "senescentapcaf")] <- "senescenceapcaf"
+  
+  out
+}
+
+fix_module_label <- function(x) {
+  k <- norm_key(x)
+  
+  if (
+    grepl("derived", k) |
+    grepl("markerassociated", k) |
+    grepl("associatedecm", k) |
+    grepl("associatedsasp", k)
+  ) {
+    return(NA_character_)
+  }
+  
+  if (grepl("otherapcaf", k)) return("no-senescence apCAF")
+  if (grepl("nosenescence|nonsenescence|nosenescent|nonsenescent", k)) return("no-senescence apCAF")
+  
+  if (grepl("presenescence|presenescent", k)) return("pre-senescence apCAF")
+  
+  if (grepl("saspsenescence|saspsenescent", k)) return("SASP senescence apCAF")
+  if (grepl("ecmsenescence|ecmsenescent", k)) return("ECM senescence apCAF")
+  
+  if (k %in% c("senescenceapcaf", "senescentapcaf")) return("senescence apCAF")
+  
+  if (
+    grepl("senescence", k) &
+    !grepl("pre|presen|ecm|sasp|no|non|other", k)
+  ) {
+    return("senescence apCAF")
+  }
+  
+  NA_character_
+}
+
+module_priority <- function(raw_label, final_label) {
+  k <- norm_key(raw_label)
+  
+  if (is.na(final_label)) return(999L)
+  
+  if (final_label == "no-senescence apCAF") {
+    if (grepl("otherapcaf", k)) return(1L)
+    if (grepl("nosenescence|nonsenescence", k)) return(2L)
+    return(9L)
+  }
+  
+  if (final_label == "pre-senescence apCAF" && grepl("pre", k)) return(1L)
+  if (final_label == "senescence apCAF" && k %in% c("senescenceapcaf", "senescentapcaf")) return(1L)
+  if (final_label == "ECM senescence apCAF" && grepl("ecm", k)) return(1L)
+  if (final_label == "SASP senescence apCAF" && grepl("sasp", k)) return(1L)
+  
+  9L
+}
+
+pick_score_col <- function(df) {
+  preferred <- c(
+    "module_score",
+    "marker_score",
+    "module_score_z",
+    "marker_score_z",
+    "score",
+    "spot_score",
+    "UCell_score",
+    "ucell_score"
+  )
+  
+  hit <- preferred[preferred %in% colnames(df)]
+  
+  if (length(hit) > 0) {
+    return(hit[1])
+  }
+  
+  cn <- colnames(df)
+  
+  cand <- cn[
+    grepl("module.*score|marker.*score|ucell.*score|score", cn, ignore.case = TRUE) &
+      !grepl("xcell|distance|near|far|hotspot|group|mean|median|pct|count|n_", cn, ignore.case = TRUE)
+  ]
+  
+  if (length(cand) > 0) {
+    return(cand[1])
+  }
+  
+  NA_character_
+}
+
+############################################################
+## 5. Immune / Stromal xCell 细胞类型映射
+############################################################
+
+immune_cells <- c(
+  "CD4+ T-cells",
+  "CD4+ naive T-cells",
+  "CD4+ memory T-cells",
+  "CD4+ Tcm",
+  "CD4+ Tem",
+  "CD8+ T-cells",
+  "CD8+ naive T-cells",
+  "CD8+ Tcm",
+  "CD8+ Tem",
+  "Th1 cells",
+  "Th2 cells",
+  "Tregs",
+  "Tgd cells",
+  "B-cells",
+  "naive B-cells",
+  "Memory B-cells",
+  "Class-switched memory B-cells",
+  "Plasma cells",
+  "pro B-cells",
+  "NK cells",
+  "NKT",
+  "DC",
+  "aDC",
+  "cDC",
+  "iDC",
+  "pDC",
+  "Monocytes",
+  "Macrophages",
+  "Macrophages M1",
+  "Macrophages M2",
+  "Neutrophils",
+  "Eosinophils",
+  "Basophils",
+  "Mast cells"
+)
+
+stromal_cells <- c(
+  "Fibroblasts",
+  "MSC",
+  "Endothelial cells",
+  "mv Endothelial cells",
+  "ly Endothelial cells",
+  "Pericytes",
+  "Myocytes",
+  "Skeletal muscle",
+  "Smooth muscle",
+  "Adipocytes",
+  "Preadipocytes",
+  "Osteoblast",
+  "Osteoblasts",
+  "Chondrocytes"
+)
+
+celltype_to_category <- dplyr::bind_rows(
+  data.frame(
+    xcell_celltype = immune_cells,
+    xcell_celltype_norm = norm_cell(immune_cells),
+    cell_category = "Immune cells",
+    stringsAsFactors = FALSE
+  ),
+  data.frame(
+    xcell_celltype = stromal_cells,
+    xcell_celltype_norm = norm_cell(stromal_cells),
+    cell_category = "Stromal cells",
+    stringsAsFactors = FALSE
+  )
+)
+
+write.csv(
+  celltype_to_category,
+  file.path(DIR_TAB, "00_Immune_Stromal_celltype_mapping.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## 6. 搜索输入文件
+############################################################
+
+if (!dir.exists(ROOT_XCELL)) {
+  stop("找不到 ROOT_XCELL：", ROOT_XCELL)
+}
+
+all_csv_files <- list.files(
+  ROOT_XCELL,
+  pattern = "\\.csv$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+spot_group_files <- all_csv_files[
+  grepl("_spot_marker_score_and_distance_group\\.csv$", basename(all_csv_files), ignore.case = TRUE)
+]
+
+if (length(spot_group_files) == 0) {
+  spot_group_files <- all_csv_files[
+    grepl("spot.*marker.*score.*distance.*group", basename(all_csv_files), ignore.case = TRUE)
+  ]
+}
+
+xcell_long_files <- all_csv_files[
+  grepl("_xCell_score_long\\.csv$", basename(all_csv_files), ignore.case = TRUE) |
+    grepl("xCell_score_long", basename(all_csv_files), ignore.case = TRUE)
+]
+
+if (length(spot_group_files) == 0) {
+  stop("没有找到 *_spot_marker_score_and_distance_group.csv。")
+}
+
+if (length(xcell_long_files) == 0) {
+  stop("没有找到 *_xCell_score_long.csv。")
+}
+
+write.csv(
+  data.frame(spot_group_file = spot_group_files),
+  file.path(DIR_TAB, "00_spot_group_files_found.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  data.frame(xcell_long_file = xcell_long_files),
+  file.path(DIR_TAB, "00_xCell_score_long_files_found.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## 7. 建立模块文件配对
+############################################################
+
+get_module_label_from_spot <- function(spot_file) {
+  dfh <- tryCatch(
+    read.csv(spot_file, stringsAsFactors = FALSE, check.names = FALSE, nrows = 30),
+    error = function(e) data.frame()
+  )
+  
+  if (nrow(dfh) > 0) {
+    module_col <- find_first_col(dfh, c("object_label", "module_label", "object_id", "module"))
+    
+    if (!is.na(module_col)) {
+      val <- unique(na.omit(as.character(dfh[[module_col]])))
+      val <- val[val != ""]
+      if (length(val) > 0) return(val[1])
+    }
+  }
+  
+  basename(dirname(dirname(spot_file)))
+}
+
+find_xcell_long_for_spot <- function(spot_file, raw_label, all_long_files) {
+  same_dir <- dirname(spot_file)
+  
+  cand_same <- list.files(
+    same_dir,
+    pattern = "xCell_score_long.*\\.csv$|_xCell_score_long\\.csv$",
+    full.names = TRUE,
+    ignore.case = TRUE
+  )
+  
+  if (length(cand_same) > 0) {
+    return(cand_same[1])
+  }
+  
+  alias <- module_alias_key(raw_label)
+  raw_norm <- norm_key(raw_label)
+  path_norm <- norm_key(all_long_files)
+  
+  hit <- all_long_files[
+    grepl(alias, path_norm, fixed = TRUE) |
+      grepl(raw_norm, path_norm, fixed = TRUE)
+  ]
+  
+  if (length(hit) > 0) return(hit[1])
+  
+  NA_character_
+}
+
+file_map_all <- dplyr::bind_rows(
+  lapply(spot_group_files, function(f) {
+    raw_label <- get_module_label_from_spot(f)
+    final_label <- fix_module_label(raw_label)
+    xlong <- find_xcell_long_for_spot(f, raw_label, xcell_long_files)
+    
+    data.frame(
+      module_label_raw = raw_label,
+      module_label_final = final_label,
+      module_alias_raw = module_alias_key(raw_label),
+      source_priority = module_priority(raw_label, final_label),
+      spot_group_file = f,
+      xcell_long_file = xlong,
+      has_xcell_long = !is.na(xlong) && file.exists(xlong),
+      stringsAsFactors = FALSE
+    )
+  })
+)
+
+file_map_all <- file_map_all %>%
+  dplyr::mutate(
+    module_label_final = factor(module_label_final, levels = FINAL_MODULE_ORDER)
+  ) %>%
+  dplyr::arrange(module_label_final, source_priority, spot_group_file) %>%
+  dplyr::mutate(
+    module_label_final = as.character(module_label_final)
+  )
+
+write.csv(
+  file_map_all,
+  file.path(DIR_TAB, "00_module_file_pairing_all_candidates.csv"),
+  row.names = FALSE
+)
+
+file_map_used <- file_map_all %>%
+  dplyr::filter(
+    !is.na(module_label_final),
+    module_label_final %in% FINAL_MODULE_ORDER,
+    has_xcell_long
+  ) %>%
+  dplyr::mutate(
+    module_label_final = factor(module_label_final, levels = FINAL_MODULE_ORDER)
+  ) %>%
+  dplyr::arrange(module_label_final, source_priority) %>%
+  dplyr::group_by(module_label_final) %>%
+  dplyr::slice(1) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    module_label_final = as.character(module_label_final)
+  )
+
+write.csv(
+  file_map_used,
+  file.path(DIR_TAB, "00_module_file_pairing_USED.csv"),
+  row.names = FALSE
+)
+
+missing_modules <- setdiff(FINAL_MODULE_ORDER, file_map_used$module_label_final)
+
+if (length(missing_modules) > 0) {
+  warning("这些目标模块没有找到可用文件：", paste(missing_modules, collapse = ", "))
+}
+
+if (nrow(file_map_used) == 0) {
+  stop("没有任何目标模块成功配对 spot_group_file 和 xCell_score_long_file。")
+}
+
+############################################################
+## 8. 读取模块 spot score，整理到 pseudo-sample/circle 距离组层面
+############################################################
+
+read_module_score_by_distance <- function(spot_file, module_label_final) {
+  
+  message("读取模块 spot 文件：", spot_file)
+  
+  df <- read.csv(
+    spot_file,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+  
+  section_col <- find_first_col(df, c("section", "sample_short"))
+  group_col <- find_first_col(df, c("xcell_group", "distance_group", "group", "group_label"))
+  score_col <- pick_score_col(df)
+  circle_col <- find_first_col(df, c("pseudo_circle_id", "circle_id", "circle"))
+  hnas_col <- find_first_col(df, c("HNas_code", "hnas_code", "HNas"))
+  spot_col <- find_first_col(df, c("spot_id", "barcode"))
+  
+  if (is.na(section_col)) stop("spot 文件缺少 section/sample_short 列：", spot_file)
+  if (is.na(group_col)) stop("spot 文件缺少 xcell_group/distance_group/group 列：", spot_file)
+  if (is.na(score_col)) stop("spot 文件缺少 module score 列：", spot_file)
+  if (is.na(circle_col) && is.na(hnas_col)) stop("spot 文件缺少 pseudo_circle_id/circle_id/HNas_code：", spot_file)
+  
+  out0 <- df %>%
+    dplyr::mutate(
+      module_label = module_label_final,
+      section = normalize_section(.data[[section_col]]),
+      xcell_group = normalize_group(.data[[group_col]]),
+      module_score = as.numeric(.data[[score_col]]),
+      circle_raw = get_col_or_na(df, circle_col),
+      hnas_raw = get_col_or_na(df, hnas_col),
+      circle_clean = make_id(circle_raw),
+      HNas_code_clean = make_id(hnas_raw),
+      unit_id = dplyr::case_when(
+        !is.na(HNas_code_clean) & HNas_code_clean != "" ~ HNas_code_clean,
+        !is.na(circle_clean) & circle_clean != "" ~ circle_clean,
+        TRUE ~ NA_character_
+      ),
+      spot_id = if (!is.na(spot_col)) as.character(.data[[spot_col]]) else as.character(dplyr::row_number())
+    ) %>%
+    dplyr::filter(
+      section %in% c("L", "R", "LR_combined"),
+      xcell_group %in% GROUP_ORDER,
+      !is.na(unit_id),
+      unit_id != "",
+      is.finite(module_score)
+    )
+  
+  if (nrow(out0) == 0) {
+    stop("模块 spot 表标准化后为空：", spot_file)
+  }
+  
+  ## section-specific score
+  sec_score <- out0 %>%
+    dplyr::group_by(
+      module_label,
+      section,
+      unit_id,
+      xcell_group
+    ) %>%
+    dplyr::summarise(
+      module_score = mean(module_score, na.rm = TRUE),
+      module_score_median = median(module_score, na.rm = TRUE),
+      n_spots_module = dplyr::n_distinct(spot_id),
+      circle_id_examples = paste(unique(na.omit(circle_clean))[1:min(5, length(unique(na.omit(circle_clean))))], collapse = ";"),
+      HNas_examples = paste(unique(na.omit(HNas_code_clean))[1:min(5, length(unique(na.omit(HNas_code_clean))))], collapse = ";"),
+      score_col_used = score_col,
+      spot_group_file = spot_file,
+      .groups = "drop"
+    )
+  
+  ## LR_combined score：如果原文件没有 LR_combined，则按 unit_id + distance group 聚合 L/R
+  lr_score <- out0 %>%
+    dplyr::group_by(
+      module_label,
+      unit_id,
+      xcell_group
+    ) %>%
+    dplyr::summarise(
+      section = "LR_combined",
+      module_score = mean(module_score, na.rm = TRUE),
+      module_score_median = median(module_score, na.rm = TRUE),
+      n_spots_module = dplyr::n_distinct(spot_id),
+      circle_id_examples = paste(unique(na.omit(circle_clean))[1:min(5, length(unique(na.omit(circle_clean))))], collapse = ";"),
+      HNas_examples = paste(unique(na.omit(HNas_code_clean))[1:min(5, length(unique(na.omit(HNas_code_clean))))], collapse = ";"),
+      score_col_used = score_col,
+      spot_group_file = spot_file,
+      .groups = "drop"
+    ) %>%
+    dplyr::select(
+      module_label,
+      section,
+      unit_id,
+      xcell_group,
+      module_score,
+      module_score_median,
+      n_spots_module,
+      circle_id_examples,
+      HNas_examples,
+      score_col_used,
+      spot_group_file
+    )
+  
+  dplyr::bind_rows(sec_score, lr_score) %>%
+    dplyr::mutate(
+      xcell_group = factor(xcell_group, levels = GROUP_ORDER)
+    ) %>%
+    dplyr::arrange(module_label, section, unit_id, xcell_group) %>%
+    dplyr::mutate(
+      xcell_group = as.character(xcell_group)
+    )
+}
+
+############################################################
+## 9. 读取 xCell long，压缩成 immune_score / stromal_score
+############################################################
+
+read_xcell_immune_stromal <- function(xcell_long_file, module_label_final) {
+  
+  message("读取 xCell long 文件：", xcell_long_file)
+  
+  df <- read.csv(
+    xcell_long_file,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+  
+  cell_col <- find_first_col(df, c("xcell_celltype", "cell_type", "celltype"))
+  score_col <- find_first_col(df, c("xcell_score", "score", "mean_score"))
+  sample_col <- find_first_col(df, c("pseudo_sample_id", "sample_id", "pseudosample_id"))
+  section_col <- find_first_col(df, c("section", "sample_short"))
+  group_col <- find_first_col(df, c("xcell_group", "distance_group", "group", "group_label"))
+  circle_col <- find_first_col(df, c("pseudo_circle_id", "circle_id", "circle"))
+  hnas_col <- find_first_col(df, c("HNas_code", "hnas_code", "HNas"))
+  nspot_col <- find_first_col(df, c("n_spots", "n_spot", "spot_count"))
+  
+  if (is.na(cell_col)) stop("xCell long 缺少 xcell_celltype/cell_type 列：", xcell_long_file)
+  if (is.na(score_col)) stop("xCell long 缺少 xcell_score/score 列：", xcell_long_file)
+  if (is.na(group_col)) stop("xCell long 缺少 xcell_group/distance_group/group 列：", xcell_long_file)
+  
+  x0 <- df %>%
+    dplyr::mutate(
+      module_label = module_label_final,
+      pseudo_sample_id = if (!is.na(sample_col)) as.character(.data[[sample_col]]) else paste0("sample_", dplyr::row_number()),
+      section = if (!is.na(section_col)) normalize_section(.data[[section_col]]) else "LR_combined",
+      xcell_group = normalize_group(.data[[group_col]]),
+      xcell_celltype = as.character(.data[[cell_col]]),
+      xcell_celltype_norm = norm_cell(xcell_celltype),
+      xcell_score = as.numeric(.data[[score_col]]),
+      circle_raw = get_col_or_na(df, circle_col),
+      hnas_raw = get_col_or_na(df, hnas_col),
+      circle_clean = make_id(circle_raw),
+      HNas_code_clean = make_id(hnas_raw),
+      unit_id = dplyr::case_when(
+        !is.na(HNas_code_clean) & HNas_code_clean != "" ~ HNas_code_clean,
+        !is.na(circle_clean) & circle_clean != "" ~ circle_clean,
+        TRUE ~ make_id(pseudo_sample_id)
+      ),
+      n_spots_xcell = if (!is.na(nspot_col)) as.numeric(.data[[nspot_col]]) else NA_real_
+    ) %>%
+    dplyr::filter(
+      section %in% c("L", "R", "LR_combined"),
+      xcell_group %in% GROUP_ORDER,
+      is.finite(xcell_score),
+      !is.na(unit_id),
+      unit_id != ""
+    )
+  
+  if (nrow(x0) == 0) {
+    stop("xCell long 标准化后为空：", xcell_long_file)
+  }
+  
+  ## 64 细胞类型归并
+  x64 <- x0 %>%
+    dplyr::left_join(
+      celltype_to_category %>%
+        dplyr::select(xcell_celltype_norm, cell_category),
+      by = "xcell_celltype_norm"
+    ) %>%
+    dplyr::filter(
+      cell_category %in% c("Immune cells", "Stromal cells")
+    )
+  
+  if (nrow(x64) > 0) {
+    
+    x64_z <- x64 %>%
+      dplyr::group_by(xcell_celltype_norm) %>%
+      dplyr::mutate(
+        xcell_score_z = safe_z(xcell_score)
+      ) %>%
+      dplyr::ungroup()
+    
+    cat_long <- x64_z %>%
+      dplyr::group_by(
+        module_label,
+        section,
+        unit_id,
+        xcell_group,
+        cell_category
+      ) %>%
+      dplyr::summarise(
+        category_score_raw = mean(xcell_score, na.rm = TRUE),
+        category_score_z = mean(xcell_score_z, na.rm = TRUE),
+        n_celltypes_used = dplyr::n_distinct(xcell_celltype_norm),
+        xcell_source = "manual_64cell_category",
+        xcell_long_file = xcell_long_file,
+        .groups = "drop"
+      )
+    
+  } else {
+    
+    if (!ALLOW_AGGREGATE_FALLBACK) {
+      stop("没有匹配到 64 类 immune/stromal xCell 细胞类型：", xcell_long_file)
+    }
+    
+    message("没有匹配到 64 类细胞类型，使用 ImmuneScore/StromaScore 兜底：", xcell_long_file)
+    
+    xagg <- x0 %>%
+      dplyr::filter(
+        xcell_celltype %in% c("ImmuneScore", "StromaScore")
+      ) %>%
+      dplyr::mutate(
+        cell_category = dplyr::case_when(
+          xcell_celltype == "ImmuneScore" ~ "Immune cells",
+          xcell_celltype == "StromaScore" ~ "Stromal cells",
+          TRUE ~ NA_character_
+        )
+      ) %>%
+      dplyr::filter(
+        cell_category %in% c("Immune cells", "Stromal cells")
+      )
+    
+    if (nrow(xagg) == 0) {
+      stop("既没有 64 类细胞类型，也没有 ImmuneScore/StromaScore：", xcell_long_file)
+    }
+    
+    xagg_z <- xagg %>%
+      dplyr::group_by(xcell_celltype_norm) %>%
+      dplyr::mutate(
+        xcell_score_z = safe_z(xcell_score)
+      ) %>%
+      dplyr::ungroup()
+    
+    cat_long <- xagg_z %>%
+      dplyr::group_by(
+        module_label,
+        section,
+        unit_id,
+        xcell_group,
+        cell_category
+      ) %>%
+      dplyr::summarise(
+        category_score_raw = mean(xcell_score, na.rm = TRUE),
+        category_score_z = mean(xcell_score_z, na.rm = TRUE),
+        n_celltypes_used = dplyr::n_distinct(xcell_celltype_norm),
+        xcell_source = "aggregate_ImmuneScore_StromaScore_fallback",
+        xcell_long_file = xcell_long_file,
+        .groups = "drop"
+      )
+  }
+  
+  cat_wide_z <- cat_long %>%
+    dplyr::select(
+      module_label,
+      section,
+      unit_id,
+      xcell_group,
+      cell_category,
+      category_score_z
+    ) %>%
+    tidyr::pivot_wider(
+      names_from = cell_category,
+      values_from = category_score_z
+    )
+  
+  cat_wide_raw <- cat_long %>%
+    dplyr::select(
+      module_label,
+      section,
+      unit_id,
+      xcell_group,
+      cell_category,
+      category_score_raw
+    ) %>%
+    tidyr::pivot_wider(
+      names_from = cell_category,
+      values_from = category_score_raw
+    )
+  
+  meta <- cat_long %>%
+    dplyr::group_by(
+      module_label,
+      section,
+      unit_id,
+      xcell_group
+    ) %>%
+    dplyr::summarise(
+      n_immune_celltypes_used = sum(n_celltypes_used[cell_category == "Immune cells"], na.rm = TRUE),
+      n_stromal_celltypes_used = sum(n_celltypes_used[cell_category == "Stromal cells"], na.rm = TRUE),
+      xcell_source = paste(unique(xcell_source), collapse = ";"),
+      xcell_long_file = paste(unique(xcell_long_file), collapse = ";"),
+      .groups = "drop"
+    )
+  
+  out <- cat_wide_z %>%
+    dplyr::rename(
+      immune_score_zmean = `Immune cells`,
+      stromal_score_zmean = `Stromal cells`
+    ) %>%
+    dplyr::left_join(
+      cat_wide_raw %>%
+        dplyr::rename(
+          immune_score_rawmean = `Immune cells`,
+          stromal_score_rawmean = `Stromal cells`
+        ),
+      by = c("module_label", "section", "unit_id", "xcell_group")
+    ) %>%
+    dplyr::left_join(
+      meta,
+      by = c("module_label", "section", "unit_id", "xcell_group")
+    ) %>%
+    dplyr::mutate(
+      immune_score = if (XCELL_SCORE_MODE == "raw_mean") immune_score_rawmean else immune_score_zmean,
+      stromal_score = if (XCELL_SCORE_MODE == "raw_mean") stromal_score_rawmean else stromal_score_zmean
+    ) %>%
+    dplyr::filter(
+      is.finite(immune_score),
+      is.finite(stromal_score)
+    )
+  
+  ## 如果原始 xCell long 没有 LR_combined，则额外生成一个 pooled LR_combined
+  if (!any(out$section == "LR_combined")) {
+    pooled <- out %>%
+      dplyr::group_by(
+        module_label,
+        unit_id,
+        xcell_group
+      ) %>%
+      dplyr::summarise(
+        section = "LR_combined",
+        immune_score_zmean = mean(immune_score_zmean, na.rm = TRUE),
+        stromal_score_zmean = mean(stromal_score_zmean, na.rm = TRUE),
+        immune_score_rawmean = mean(immune_score_rawmean, na.rm = TRUE),
+        stromal_score_rawmean = mean(stromal_score_rawmean, na.rm = TRUE),
+        immune_score = mean(immune_score, na.rm = TRUE),
+        stromal_score = mean(stromal_score, na.rm = TRUE),
+        n_immune_celltypes_used = max(n_immune_celltypes_used, na.rm = TRUE),
+        n_stromal_celltypes_used = max(n_stromal_celltypes_used, na.rm = TRUE),
+        xcell_source = paste(unique(xcell_source), collapse = ";"),
+        xcell_long_file = paste(unique(xcell_long_file), collapse = ";"),
+        .groups = "drop"
+      ) %>%
+      dplyr::select(
+        module_label,
+        section,
+        unit_id,
+        xcell_group,
+        immune_score_zmean,
+        stromal_score_zmean,
+        immune_score_rawmean,
+        stromal_score_rawmean,
+        n_immune_celltypes_used,
+        n_stromal_celltypes_used,
+        xcell_source,
+        xcell_long_file,
+        immune_score,
+        stromal_score
+      )
+    
+    out <- dplyr::bind_rows(out, pooled)
+  }
+  
+  out %>%
+    dplyr::mutate(
+      xcell_group = factor(xcell_group, levels = GROUP_ORDER)
+    ) %>%
+    dplyr::arrange(module_label, section, unit_id, xcell_group) %>%
+    dplyr::mutate(
+      xcell_group = as.character(xcell_group)
+    )
+}
+############################################################
+## 10. 循环读取所有模块并对齐
+## 修正版：不用 <<-，避免 module_score_list 找不到
+############################################################
+
+module_score_list <- list()
+xcell_score_list <- list()
+join_list <- list()
+error_list <- list()
+status_list <- list()
+
+for (i in seq_len(nrow(file_map_used))) {
+  
+  mod <- file_map_used$module_label_final[i]
+  spot_file <- file_map_used$spot_group_file[i]
+  xcell_file <- file_map_used$xcell_long_file[i]
+  
+  message("============================================================")
+  message("处理模块：", mod)
+  message("spot 文件：", spot_file)
+  message("xCell 文件：", xcell_file)
+  message("============================================================")
+  
+  res_i <- tryCatch(
+    {
+      mod_score <- read_module_score_by_distance(
+        spot_file = spot_file,
+        module_label_final = mod
+      )
+      
+      xcell_score <- read_xcell_immune_stromal(
+        xcell_long_file = xcell_file,
+        module_label_final = mod
+      )
+      
+      joined <- mod_score %>%
+        dplyr::inner_join(
+          xcell_score,
+          by = c(
+            "module_label",
+            "section",
+            "unit_id",
+            "xcell_group"
+          )
+        ) %>%
+        dplyr::filter(
+          is.finite(module_score),
+          is.finite(immune_score),
+          is.finite(stromal_score)
+        )
+      
+      if (nrow(joined) == 0) {
+        stop("模块 score 与 xCell score 对齐后为空。")
+      }
+      
+      list(
+        status = data.frame(
+          module_label = mod,
+          status = "success",
+          n_module_score_rows = nrow(mod_score),
+          n_xcell_score_rows = nrow(xcell_score),
+          n_joined_rows = nrow(joined),
+          n_joined_units = dplyr::n_distinct(joined$unit_id),
+          error_message = NA_character_,
+          stringsAsFactors = FALSE
+        ),
+        mod_score = mod_score,
+        xcell_score = xcell_score,
+        joined = joined,
+        error = NULL
+      )
+    },
+    error = function(e) {
+      msg <- e$message
+      message("模块失败：", mod, " | ", msg)
+      
+      list(
+        status = data.frame(
+          module_label = mod,
+          status = "failed",
+          n_module_score_rows = NA_integer_,
+          n_xcell_score_rows = NA_integer_,
+          n_joined_rows = NA_integer_,
+          n_joined_units = NA_integer_,
+          error_message = msg,
+          stringsAsFactors = FALSE
+        ),
+        mod_score = NULL,
+        xcell_score = NULL,
+        joined = NULL,
+        error = data.frame(
+          module_label = mod,
+          spot_group_file = spot_file,
+          xcell_long_file = xcell_file,
+          error_message = msg,
+          stringsAsFactors = FALSE
+        )
+      )
+    }
+  )
+  
+  status_list[[mod]] <- res_i$status
+  
+  if (!is.null(res_i$mod_score)) {
+    module_score_list[[mod]] <- res_i$mod_score
+  }
+  
+  if (!is.null(res_i$xcell_score)) {
+    xcell_score_list[[mod]] <- res_i$xcell_score
+  }
+  
+  if (!is.null(res_i$joined)) {
+    join_list[[mod]] <- res_i$joined
+  }
+  
+  if (!is.null(res_i$error)) {
+    error_list[[mod]] <- res_i$error
+  }
+}
+
+run_status <- dplyr::bind_rows(status_list)
+module_score_all <- dplyr::bind_rows(module_score_list)
+xcell_score_all <- dplyr::bind_rows(xcell_score_list)
+cor_input <- dplyr::bind_rows(join_list)
+error_df <- dplyr::bind_rows(error_list)
+
+write.csv(
+  run_status,
+  file.path(DIR_TAB, "00_module_run_status.csv"),
+  row.names = FALSE
+)
+
+if (is.null(error_df) || nrow(error_df) == 0) {
+  error_df <- data.frame(
+    module_label = character(),
+    spot_group_file = character(),
+    xcell_long_file = character(),
+    error_message = character(),
+    stringsAsFactors = FALSE
+  )
+}
+
+if (nrow(cor_input) == 0) {
+  write.csv(
+    run_status,
+    file.path(DIR_TAB, "00_module_run_status_FAILED_ALL.csv"),
+    row.names = FALSE
+  )
+  
+  write.csv(
+    error_df,
+    file.path(DIR_TAB, "04_failed_module_errors.csv"),
+    row.names = FALSE
+  )
+  
+  stop(
+    "没有任何模块成功生成相关性输入表。请查看：",
+    file.path(DIR_TAB, "00_module_run_status_FAILED_ALL.csv"),
+    " 和 ",
+    file.path(DIR_TAB, "04_failed_module_errors.csv")
+  )
+}
+
+write.csv(
+  module_score_all,
+  file.path(DIR_TAB, "01_module_score_by_module_circle_distance.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  xcell_score_all,
+  file.path(DIR_TAB, "02_xCell_Immune_Stromal_by_module_circle_distance.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  cor_input,
+  file.path(DIR_TAB, "03_correlation_input_module_distance_xCell.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  error_df,
+  file.path(DIR_TAB, "04_failed_module_errors.csv"),
+  row.names = FALSE
+)
+
+input_summary <- cor_input %>%
+  dplyr::group_by(module_label, section, xcell_group) %>%
+  dplyr::summarise(
+    n_pseudosample = dplyr::n_distinct(unit_id),
+    n_rows = dplyr::n(),
+    mean_module_score = mean(module_score, na.rm = TRUE),
+    mean_immune_score = mean(immune_score, na.rm = TRUE),
+    mean_stromal_score = mean(stromal_score, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    module_label = factor(module_label, levels = FINAL_MODULE_ORDER),
+    xcell_group = factor(xcell_group, levels = GROUP_ORDER)
+  ) %>%
+  dplyr::arrange(module_label, section, xcell_group) %>%
+  dplyr::mutate(
+    module_label = as.character(module_label),
+    xcell_group = as.character(xcell_group)
+  )
+
+write.csv(
+  input_summary,
+  file.path(DIR_TAB, "05_correlation_input_summary.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## 11. 计算相关性
+############################################################
+
+calc_cor <- function(df, x_col, y_col = "module_score", method = "pearson") {
+  
+  x <- as.numeric(df[[x_col]])
+  y <- as.numeric(df[[y_col]])
+  
+  ok <- is.finite(x) & is.finite(y)
+  n_ok <- sum(ok)
+  
+  if (n_ok < MIN_N_COR) {
+    return(data.frame(
+      n = n_ok,
+      estimate = NA_real_,
+      p_value = NA_real_,
+      conf_low = NA_real_,
+      conf_high = NA_real_,
+      skipped = TRUE,
+      skip_reason = paste0("n < ", MIN_N_COR),
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  if (length(unique(x[ok])) < 3 || length(unique(y[ok])) < 3) {
+    return(data.frame(
+      n = n_ok,
+      estimate = NA_real_,
+      p_value = NA_real_,
+      conf_low = NA_real_,
+      conf_high = NA_real_,
+      skipped = TRUE,
+      skip_reason = "too_few_unique_values",
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  ct <- suppressWarnings(
+    stats::cor.test(
+      x[ok],
+      y[ok],
+      method = method,
+      exact = FALSE
+    )
+  )
+  
+  conf_low <- NA_real_
+  conf_high <- NA_real_
+  
+  if (!is.null(ct$conf.int)) {
+    conf_low <- as.numeric(ct$conf.int[1])
+    conf_high <- as.numeric(ct$conf.int[2])
+  }
+  
+  data.frame(
+    n = n_ok,
+    estimate = as.numeric(ct$estimate),
+    p_value = as.numeric(ct$p.value),
+    conf_low = conf_low,
+    conf_high = conf_high,
+    skipped = FALSE,
+    skip_reason = NA_character_,
+    stringsAsFactors = FALSE
+  )
+}
+
+section_levels <- unique(cor_input$section)
+section_levels <- c(
+  section_levels[section_levels == "LR_combined"],
+  section_levels[section_levels != "LR_combined"]
+)
+section_levels <- unique(section_levels)
+
+cor_res <- dplyr::bind_rows(
+  lapply(section_levels, function(sec) {
+    lapply(FINAL_MODULE_ORDER, function(mod) {
+      lapply(GROUP_ORDER, function(grp) {
+        
+        df_sub <- cor_input %>%
+          dplyr::filter(
+            section == sec,
+            module_label == mod,
+            xcell_group == grp
+          )
+        
+        out_list <- list()
+        
+        for (pred_col in c("immune_score", "stromal_score")) {
+          
+          pred_label <- dplyr::case_when(
+            pred_col == "immune_score" ~ "Immune score",
+            pred_col == "stromal_score" ~ "Stromal score",
+            TRUE ~ pred_col
+          )
+          
+          pearson_i <- calc_cor(
+            df = df_sub,
+            x_col = pred_col,
+            y_col = "module_score",
+            method = "pearson"
+          )
+          
+          pearson_i$section <- sec
+          pearson_i$module_label <- mod
+          pearson_i$xcell_group <- grp
+          pearson_i$predictor <- pred_label
+          pearson_i$predictor_col <- pred_col
+          pearson_i$method <- "Pearson"
+          
+          spearman_i <- calc_cor(
+            df = df_sub,
+            x_col = pred_col,
+            y_col = "module_score",
+            method = "spearman"
+          )
+          
+          spearman_i$section <- sec
+          spearman_i$module_label <- mod
+          spearman_i$xcell_group <- grp
+          spearman_i$predictor <- pred_label
+          spearman_i$predictor_col <- pred_col
+          spearman_i$method <- "Spearman"
+          
+          out_list[[length(out_list) + 1]] <- pearson_i
+          out_list[[length(out_list) + 1]] <- spearman_i
+        }
+        
+        dplyr::bind_rows(out_list)
+      }) %>%
+        dplyr::bind_rows()
+    }) %>%
+      dplyr::bind_rows()
+  })
+) %>%
+  dplyr::mutate(
+    module_label = factor(module_label, levels = FINAL_MODULE_ORDER),
+    xcell_group = factor(xcell_group, levels = GROUP_ORDER),
+    predictor = factor(predictor, levels = PREDICTOR_ORDER),
+    method = factor(method, levels = c("Pearson", "Spearman")),
+    distance_order = as.integer(xcell_group),
+    p_label = vapply(p_value, format_p, character(1)),
+    sig = p_stars(p_value),
+    label_show = dplyr::case_when(
+      is.na(estimate) ~ "NA",
+      TRUE ~ paste0(round(estimate, 2), sig)
+    )
+  ) %>%
+  dplyr::group_by(section, method) %>%
+  dplyr::mutate(
+    p_adj_BH_global = p.adjust(p_value, method = "BH")
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::group_by(section, method, module_label, predictor) %>%
+  dplyr::mutate(
+    p_adj_BH_within_module_predictor = p.adjust(p_value, method = "BH")
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(section, method, module_label, predictor, xcell_group) %>%
+  dplyr::mutate(
+    module_label = as.character(module_label),
+    xcell_group = as.character(xcell_group),
+    predictor = as.character(predictor),
+    method = as.character(method)
+  )
+
+write.csv(
+  cor_res,
+  file.path(DIR_TAB, "06_distance_module_xCell_correlation_Pearson_Spearman.csv"),
+  row.names = FALSE
+)
+
+cor_wide <- cor_res %>%
+  dplyr::select(
+    section,
+    module_label,
+    xcell_group,
+    predictor,
+    method,
+    n,
+    estimate,
+    p_value,
+    p_adj_BH_global,
+    p_adj_BH_within_module_predictor,
+    p_label,
+    sig,
+    skipped,
+    skip_reason
+  ) %>%
+  tidyr::pivot_wider(
+    id_cols = c(section, module_label, xcell_group, predictor),
+    names_from = method,
+    values_from = c(
+      n,
+      estimate,
+      p_value,
+      p_adj_BH_global,
+      p_adj_BH_within_module_predictor,
+      p_label,
+      sig,
+      skipped,
+      skip_reason
+    ),
+    names_sep = "_"
+  ) %>%
+  dplyr::mutate(
+    module_label = factor(module_label, levels = FINAL_MODULE_ORDER),
+    xcell_group = factor(xcell_group, levels = GROUP_ORDER),
+    predictor = factor(predictor, levels = PREDICTOR_ORDER)
+  ) %>%
+  dplyr::arrange(section, module_label, predictor, xcell_group) %>%
+  dplyr::mutate(
+    module_label = as.character(module_label),
+    xcell_group = as.character(xcell_group),
+    predictor = as.character(predictor)
+  )
+
+write.csv(
+  cor_wide,
+  file.path(DIR_TAB, "07_distance_module_xCell_correlation_wide.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## 12. 相关性随距离变化趋势摘要
+############################################################
+
+trend_df <- cor_res %>%
+  dplyr::filter(
+    method == MAIN_METHOD,
+    skipped == FALSE,
+    is.finite(estimate)
+  ) %>%
+  dplyr::group_by(section, module_label, predictor) %>%
+  dplyr::summarise(
+    n_distance_available = dplyr::n(),
+    r_hotspot = estimate[xcell_group == "Hotspot"][1],
+    r_near = estimate[xcell_group == "Near"][1],
+    r_middle = estimate[xcell_group == "Middle"][1],
+    r_far = estimate[xcell_group == "Far"][1],
+    r_change_far_minus_hotspot = r_far - r_hotspot,
+    trend_slope = ifelse(
+      dplyr::n() >= 3,
+      coef(lm(estimate ~ distance_order))[2],
+      NA_real_
+    ),
+    trend_direction = dplyr::case_when(
+      is.na(trend_slope) ~ NA_character_,
+      trend_slope > 0 ~ "correlation increases with distance",
+      trend_slope < 0 ~ "correlation decreases with distance",
+      TRUE ~ "flat"
+    ),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    module_label = factor(module_label, levels = FINAL_MODULE_ORDER),
+    predictor = factor(predictor, levels = PREDICTOR_ORDER)
+  ) %>%
+  dplyr::arrange(section, module_label, predictor) %>%
+  dplyr::mutate(
+    module_label = as.character(module_label),
+    predictor = as.character(predictor)
+  )
+
+write.csv(
+  trend_df,
+  file.path(DIR_TAB, "08_distance_correlation_trend_summary.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## 13. 确定主图 section
+############################################################
+
+if (MAIN_SECTION_PREFER %in% cor_res$section) {
+  MAIN_SECTION <- MAIN_SECTION_PREFER
+} else {
+  MAIN_SECTION <- section_levels[1]
+  warning("没有找到 ", MAIN_SECTION_PREFER, "，主图使用 section = ", MAIN_SECTION)
+}
+
+main_plot_df <- cor_res %>%
+  dplyr::filter(
+    section == MAIN_SECTION,
+    method == MAIN_METHOD
+  ) %>%
+  dplyr::mutate(
+    module_label = factor(module_label, levels = FINAL_MODULE_ORDER),
+    xcell_group = factor(xcell_group, levels = GROUP_ORDER),
+    predictor = factor(predictor, levels = PREDICTOR_ORDER)
+  )
+
+############################################################
+## 14. 每个模块一张距离相关性折线图
+############################################################
+
+for (mod in FINAL_MODULE_ORDER) {
+  
+  plot_i <- main_plot_df %>%
+    dplyr::filter(module_label == mod)
+  
+  if (nrow(plot_i) == 0) next
+  
+  p_i <- ggplot(
+    plot_i,
+    aes(
+      x = xcell_group,
+      y = estimate,
+      group = predictor,
+      color = predictor
+    )
+  ) +
+    geom_hline(
+      yintercept = 0,
+      linetype = "dashed",
+      linewidth = 0.45,
+      color = "grey35"
+    ) +
+    geom_line(
+      linewidth = 1.05,
+      alpha = 0.95,
+      na.rm = TRUE
+    ) +
+    geom_point(
+      size = 3.0,
+      alpha = 0.95,
+      na.rm = TRUE
+    ) +
+    geom_text(
+      aes(
+        label = ifelse(is.na(estimate), "NA", paste0(round(estimate, 2), sig))
+      ),
+      vjust = -0.95,
+      size = 3.5,
+      show.legend = FALSE,
+      na.rm = TRUE
+    ) +
+    geom_text(
+      aes(
+        label = paste0("n=", n)
+      ),
+      vjust = 1.85,
+      size = 2.8,
+      color = "grey25",
+      show.legend = FALSE,
+      na.rm = TRUE
+    ) +
+    scale_color_manual(
+      values = c(
+        "Immune score" = "#2166AC",
+        "Stromal score" = "#B2182B"
+      )
+    ) +
+    scale_y_continuous(
+      limits = c(-1, 1),
+      breaks = seq(-1, 1, by = 0.25),
+      expand = expansion(mult = c(0.08, 0.12))
+    ) +
+    theme_pub(base_size = 12) +
+    theme(
+      legend.position = "top",
+      axis.title.x = element_blank()
+    ) +
+    labs(
+      title = paste0(mod, " | distance-dependent xCell correlation"),
+      subtitle = paste0(
+        MAIN_METHOD,
+        " correlation; section = ",
+        MAIN_SECTION,
+        "; y > 0 positive correlation, y < 0 negative correlation"
+      ),
+      y = paste0(MAIN_METHOD, " correlation coefficient"),
+      color = NULL
+    )
+  
+  save_pdf_png(
+    p_i,
+    paste0("Figure_each_module_", sanitize_filename(mod), "_distance_correlation_", MAIN_METHOD),
+    width = 7.5,
+    height = 5.2,
+    outdir = DIR_FIG_MODULE
+  )
+}
+
+############################################################
+## 15. 五模块合并折线图
+############################################################
+
+p_all_line <- ggplot(
+  main_plot_df,
+  aes(
+    x = xcell_group,
+    y = estimate,
+    group = predictor,
+    color = predictor
+  )
+) +
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    linewidth = 0.40,
+    color = "grey35"
+  ) +
+  geom_line(
+    linewidth = 0.95,
+    alpha = 0.95,
+    na.rm = TRUE
+  ) +
+  geom_point(
+    size = 2.5,
+    alpha = 0.95,
+    na.rm = TRUE
+  ) +
+  geom_text(
+    aes(label = ifelse(is.na(estimate), "", sig)),
+    vjust = -1.0,
+    size = 3.5,
+    show.legend = FALSE,
+    na.rm = TRUE
+  ) +
+  scale_color_manual(
+    values = c(
+      "Immune score" = "#2166AC",
+      "Stromal score" = "#B2182B"
+    )
+  ) +
+  scale_y_continuous(
+    limits = c(-1, 1),
+    breaks = seq(-1, 1, by = 0.5),
+    expand = expansion(mult = c(0.08, 0.12))
+  ) +
+  facet_wrap(
+    ~ module_label,
+    ncol = 2
+  ) +
+  theme_pub(base_size = 11) +
+  theme(
+    legend.position = "top",
+    axis.title.x = element_blank()
+  ) +
+  labs(
+    title = "Distance-dependent correlations between apCAF modules and xCell scores",
+    subtitle = paste0(
+      MAIN_METHOD,
+      " correlation; section = ",
+      MAIN_SECTION,
+      "; 0 line separates positive and negative correlations"
+    ),
+    y = paste0(MAIN_METHOD, " correlation coefficient"),
+    color = NULL
+  )
+
+save_pdf_png(
+  p_all_line,
+  paste0("Figure_01_all_modules_distance_correlation_lineplot_", MAIN_METHOD),
+  width = 11,
+  height = 8.5,
+  outdir = DIR_FIG
+)
+
+############################################################
+## 16. 相关性热图
+############################################################
+
+p_heat <- main_plot_df %>%
+  dplyr::mutate(
+    module_label = factor(module_label, levels = rev(FINAL_MODULE_ORDER)),
+    xcell_group = factor(xcell_group, levels = GROUP_ORDER),
+    predictor = factor(predictor, levels = PREDICTOR_ORDER),
+    label_show = ifelse(is.na(estimate), "NA", paste0(round(estimate, 2), sig))
+  ) %>%
+  ggplot(
+    aes(
+      x = xcell_group,
+      y = module_label,
+      fill = estimate
+    )
+  ) +
+  geom_tile(
+    color = "white",
+    linewidth = 0.45
+  ) +
+  geom_text(
+    aes(label = label_show),
+    size = 3.8,
+    color = "black"
+  ) +
+  scale_fill_gradient2(
+    low = "#2166AC",
+    mid = "white",
+    high = "#B2182B",
+    midpoint = 0,
+    limits = c(-1, 1),
+    oob = scales::squish,
+    name = paste0(MAIN_METHOD, " r")
+  ) +
+  facet_wrap(
+    ~ predictor,
+    ncol = 2
+  ) +
+  theme_pub(base_size = 11) +
+  theme(
+    axis.title = element_blank(),
+    axis.text.x = element_text(angle = 35, hjust = 1)
+  ) +
+  labs(
+    title = "Correlation heatmap across distance groups",
+    subtitle = paste0("section = ", MAIN_SECTION, "; label = r + significance")
+  )
+
+save_pdf_png(
+  p_heat,
+  paste0("Figure_02_distance_correlation_heatmap_", MAIN_METHOD),
+  width = 10,
+  height = 5.6,
+  outdir = DIR_FIG_HEAT
+)
+
+############################################################
+## 17. 气泡图：颜色是 r，大小是 -log10(p)
+############################################################
+
+p_bubble <- main_plot_df %>%
+  dplyr::mutate(
+    module_label = factor(module_label, levels = rev(FINAL_MODULE_ORDER)),
+    xcell_group = factor(xcell_group, levels = GROUP_ORDER),
+    predictor = factor(predictor, levels = PREDICTOR_ORDER),
+    neglog10p = -log10(pmax(p_value, 1e-300)),
+    neglog10p = ifelse(is.finite(neglog10p), neglog10p, NA_real_)
+  ) %>%
+  ggplot(
+    aes(
+      x = xcell_group,
+      y = module_label
+    )
+  ) +
+  geom_point(
+    aes(
+      color = estimate,
+      size = neglog10p
+    ),
+    alpha = 0.90
+  ) +
+  geom_text(
+    aes(label = sig),
+    color = "black",
+    size = 3.6,
+    vjust = 0.35
+  ) +
+  scale_color_gradient2(
+    low = "#2166AC",
+    mid = "white",
+    high = "#B2182B",
+    midpoint = 0,
+    limits = c(-1, 1),
+    oob = scales::squish,
+    name = paste0(MAIN_METHOD, " r")
+  ) +
+  scale_size_continuous(
+    range = c(1.5, 7),
+    name = "-log10(p)"
+  ) +
+  facet_wrap(
+    ~ predictor,
+    ncol = 2
+  ) +
+  theme_pub(base_size = 11) +
+  theme(
+    axis.title = element_blank(),
+    axis.text.x = element_text(angle = 35, hjust = 1)
+  ) +
+  labs(
+    title = "Significance-weighted distance correlation bubble plot",
+    subtitle = paste0("section = ", MAIN_SECTION, "; color = r; point size = -log10(p)")
+  )
+
+save_pdf_png(
+  p_bubble,
+  paste0("Figure_03_distance_correlation_bubble_", MAIN_METHOD),
+  width = 10,
+  height = 5.6,
+  outdir = DIR_FIG_HEAT
+)
+
+############################################################
+## 18. Spearman 版本热图补充
+############################################################
+
+spearman_plot_df <- cor_res %>%
+  dplyr::filter(
+    section == MAIN_SECTION,
+    method == "Spearman"
+  ) %>%
+  dplyr::mutate(
+    module_label = factor(module_label, levels = rev(FINAL_MODULE_ORDER)),
+    xcell_group = factor(xcell_group, levels = GROUP_ORDER),
+    predictor = factor(predictor, levels = PREDICTOR_ORDER),
+    label_show = ifelse(is.na(estimate), "NA", paste0(round(estimate, 2), sig))
+  )
+
+p_spear_heat <- ggplot(
+  spearman_plot_df,
+  aes(
+    x = xcell_group,
+    y = module_label,
+    fill = estimate
+  )
+) +
+  geom_tile(
+    color = "white",
+    linewidth = 0.45
+  ) +
+  geom_text(
+    aes(label = label_show),
+    size = 3.8,
+    color = "black"
+  ) +
+  scale_fill_gradient2(
+    low = "#2166AC",
+    mid = "white",
+    high = "#B2182B",
+    midpoint = 0,
+    limits = c(-1, 1),
+    oob = scales::squish,
+    name = "Spearman ρ"
+  ) +
+  facet_wrap(
+    ~ predictor,
+    ncol = 2
+  ) +
+  theme_pub(base_size = 11) +
+  theme(
+    axis.title = element_blank(),
+    axis.text.x = element_text(angle = 35, hjust = 1)
+  ) +
+  labs(
+    title = "Spearman correlation heatmap across distance groups",
+    subtitle = paste0("section = ", MAIN_SECTION, "; label = rho + significance")
+  )
+
+save_pdf_png(
+  p_spear_heat,
+  "Figure_04_distance_correlation_heatmap_Spearman",
+  width = 10,
+  height = 5.6,
+  outdir = DIR_FIG_HEAT
+)
+
+############################################################
+## 19. Excel / RDS 汇总
+############################################################
+
+xlsx_file <- file.path(
+  DIR_XLSX,
+  "NPC_apCAF_distance_Immune_Stromal_correlation_results.xlsx"
+)
+
+openxlsx::write.xlsx(
+  list(
+    file_pairing_all = file_map_all,
+    file_pairing_used = file_map_used,
+    module_score_dist = module_score_all,
+    xCell_IS_dist = xcell_score_all,
+    cor_input = cor_input,
+    input_summary = input_summary,
+    cor_long = cor_res,
+    cor_wide = cor_wide,
+    trend_summary = trend_df,
+    failed_modules = error_df,
+    celltype_mapping = celltype_to_category
+  ),
+  file = xlsx_file,
+  overwrite = TRUE
+)
+
+rds_file <- file.path(
+  DIR_RDS,
+  "NPC_apCAF_distance_Immune_Stromal_correlation_result.rds"
+)
+
+saveRDS(
+  list(
+    parameters = list(
+      ROOT_XCELL = ROOT_XCELL,
+      OUTDIR = OUTDIR,
+      GROUP_ORDER = GROUP_ORDER,
+      FINAL_MODULE_ORDER = FINAL_MODULE_ORDER,
+      MIN_N_COR = MIN_N_COR,
+      MAIN_METHOD = MAIN_METHOD,
+      MAIN_SECTION = MAIN_SECTION,
+      XCELL_SCORE_MODE = XCELL_SCORE_MODE,
+      ALLOW_AGGREGATE_FALLBACK = ALLOW_AGGREGATE_FALLBACK,
+      note = "Correlation is calculated at module × circle/pseudo-bulk × distance-group level. Immune/Stromal scores are generated from xCell pseudo-sample output by averaging immune/stromal cell-type scores."
+    ),
+    file_map_all = file_map_all,
+    file_map_used = file_map_used,
+    module_score_all = module_score_all,
+    xcell_score_all = xcell_score_all,
+    cor_input = cor_input,
+    input_summary = input_summary,
+    cor_res = cor_res,
+    cor_wide = cor_wide,
+    trend_df = trend_df,
+    error_df = error_df,
+    celltype_to_category = celltype_to_category
+  ),
+  file = rds_file
+)
+
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(OUTDIR, "sessionInfo_distance_Immune_Stromal_correlation.txt")
+)
+
+############################################################
+## 20. 完成
+############################################################
+
+pdf_files <- list.files(
+  DIR_FIG,
+  pattern = "\\.pdf$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+png_files <- list.files(
+  DIR_FIG,
+  pattern = "\\.png$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+message("============================================================")
+message("完成：不同模块不同距离组下 module score 与 Immune/Stromal score 相关性分析")
+message("输出目录：", OUTDIR)
+message("表格目录：", DIR_TAB)
+message("图片目录：", DIR_FIG)
+message("每模块折线图目录：", DIR_FIG_MODULE)
+message("热图/气泡图目录：", DIR_FIG_HEAT)
+message("Excel：", xlsx_file)
+message("RDS：", rds_file)
+message("主图 section：", MAIN_SECTION)
+message("主图相关方法：", MAIN_METHOD)
+message("xCell 分数模式：", XCELL_SCORE_MODE)
+message("PDF 数量：", length(pdf_files))
+message("PNG 数量：", length(png_files))
+message("核心结果表：")
+message("1) ", file.path(DIR_TAB, "03_correlation_input_module_distance_xCell.csv"))
+message("2) ", file.path(DIR_TAB, "06_distance_module_xCell_correlation_Pearson_Spearman.csv"))
+message("3) ", file.path(DIR_TAB, "07_distance_module_xCell_correlation_wide.csv"))
+message("4) ", file.path(DIR_TAB, "08_distance_correlation_trend_summary.csv"))
+message("核心图片：")
+message("1) ", file.path(DIR_FIG, paste0("Figure_01_all_modules_distance_correlation_lineplot_", MAIN_METHOD, ".pdf")))
+message("2) ", file.path(DIR_FIG_HEAT, paste0("Figure_02_distance_correlation_heatmap_", MAIN_METHOD, ".pdf")))
+message("3) ", file.path(DIR_FIG_HEAT, paste0("Figure_03_distance_correlation_bubble_", MAIN_METHOD, ".pdf")))
+message("============================================================")
+
+print(pdf_files)
