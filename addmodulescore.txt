@@ -1,0 +1,870 @@
+
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+options(future.globals.maxSize = 100 * 1024^3)
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(data.table)
+  library(dplyr)
+  library(ggplot2)
+  library(Matrix)
+})
+
+############################################################
+## 1. 路径设置
+############################################################
+
+PATH_RDS <- "/media/desk16/iy2142/wzqB/CAF_Subtypes_Annotated.rds"
+PATH_MARKER <- "/media/desk16/iy2142/wzqB/细胞衰老.tsv"
+
+DIR_OUT <- "/media/desk16/iy2142/wzqB/细胞衰老_AddModuleScore_apCAF"
+dir.create(DIR_OUT, recursive = TRUE, showWarnings = FALSE)
+
+ASSAY_USE <- "RNA"
+ANNO_COL <- "celltype.2nd"
+
+set.seed(123)
+
+############################################################
+## 2. 读取 Seurat 对象
+############################################################
+
+caf_obj <- readRDS(PATH_RDS)
+
+cat("Seurat 对象读取完成\n")
+cat("细胞数:", ncol(caf_obj), "\n")
+cat("基因数:", nrow(caf_obj), "\n")
+cat("Assays:", paste(Assays(caf_obj), collapse = ", "), "\n")
+cat("DefaultAssay:", DefaultAssay(caf_obj), "\n\n")
+
+if (!(ASSAY_USE %in% Assays(caf_obj))) {
+  ASSAY_USE <- DefaultAssay(caf_obj)
+}
+
+DefaultAssay(caf_obj) <- ASSAY_USE
+
+cat("当前使用 assay:", ASSAY_USE, "\n\n")
+
+############################################################
+## 3. 检查原注释列
+############################################################
+
+cat("metadata 列名：\n")
+print(colnames(caf_obj@meta.data))
+
+if (!(ANNO_COL %in% colnames(caf_obj@meta.data))) {
+  stop(paste0("没有找到注释列：", ANNO_COL))
+}
+
+cat("\n当前使用 CAF 亚型注释列：", ANNO_COL, "\n")
+cat("CAF 亚型数量：\n")
+print(table(caf_obj[[ANNO_COL]][, 1]))
+
+caf_obj$CAF_subtype_for_senescence <- as.character(caf_obj[[ANNO_COL]][, 1])
+
+caf_obj$CAF_subtype_for_senescence <- factor(
+  caf_obj$CAF_subtype_for_senescence,
+  levels = c("apCAF", "iCAF", "myCAF")
+)
+
+Idents(caf_obj) <- caf_obj$CAF_subtype_for_senescence
+
+############################################################
+## 4. Seurat v5 layer 处理
+############################################################
+
+if ("Assay5" %in% class(caf_obj[[ASSAY_USE]])) {
+  cat("\n检测到 Seurat v5 Assay5，尝试 JoinLayers...\n")
+  
+  caf_obj <- tryCatch({
+    JoinLayers(caf_obj, assay = ASSAY_USE)
+  }, error = function(e) {
+    cat("JoinLayers 未成功或不需要，继续运行。\n")
+    cat(e$message, "\n")
+    caf_obj
+  })
+}
+
+############################################################
+## 5. 检查 data 层；如果没有则 NormalizeData
+############################################################
+
+get_data_mat <- function(obj, assay_use) {
+  mat <- tryCatch({
+    GetAssayData(obj, assay = assay_use, layer = "data")
+  }, error = function(e) {
+    GetAssayData(obj, assay = assay_use, slot = "data")
+  })
+  
+  return(mat)
+}
+
+data_mat <- tryCatch({
+  get_data_mat(caf_obj, ASSAY_USE)
+}, error = function(e) {
+  NULL
+})
+
+if (is.null(data_mat) || nrow(data_mat) == 0 || ncol(data_mat) == 0) {
+  cat("\n没有检测到 normalized data，开始 NormalizeData...\n")
+  caf_obj <- NormalizeData(
+    caf_obj,
+    assay = ASSAY_USE,
+    normalization.method = "LogNormalize",
+    scale.factor = 10000,
+    verbose = FALSE
+  )
+  
+  data_mat <- get_data_mat(caf_obj, ASSAY_USE)
+}
+
+############################################################
+## 6. 读取细胞衰老 marker
+############################################################
+
+marker_df <- fread(PATH_MARKER, data.table = FALSE)
+
+cat("\n细胞衰老 marker 文件列名：\n")
+print(colnames(marker_df))
+
+if ("Gene symbol" %in% colnames(marker_df)) {
+  marker_raw <- marker_df[["Gene symbol"]]
+} else if ("gene" %in% colnames(marker_df)) {
+  marker_raw <- marker_df[["gene"]]
+} else if ("Gene" %in% colnames(marker_df)) {
+  marker_raw <- marker_df[["Gene"]]
+} else {
+  marker_raw <- marker_df[[1]]
+}
+
+marker_raw <- as.character(marker_raw)
+marker_raw <- trimws(marker_raw)
+marker_raw <- marker_raw[!is.na(marker_raw)]
+marker_raw <- marker_raw[marker_raw != ""]
+marker_raw <- unique(marker_raw)
+
+cat("\n去重后细胞衰老 marker 数量:", length(marker_raw), "\n")
+
+############################################################
+## 7. marker 和表达矩阵基因匹配
+## 支持大写/小写差异
+############################################################
+
+all_features <- rownames(caf_obj[[ASSAY_USE]])
+
+feature_key <- toupper(all_features)
+feature_map <- all_features
+names(feature_map) <- feature_key
+feature_map <- feature_map[!duplicated(names(feature_map))]
+
+marker_key <- toupper(marker_raw)
+
+matched_key <- intersect(marker_key, names(feature_map))
+score_genes <- unique(unname(feature_map[matched_key]))
+
+unmatched_marker <- marker_raw[!(toupper(marker_raw) %in% matched_key)]
+
+cat("匹配到的细胞衰老 marker 数量:", length(score_genes), "\n")
+cat("未匹配到的细胞衰老 marker 数量:", length(unmatched_marker), "\n\n")
+
+write.csv(
+  data.frame(gene = score_genes),
+  file = file.path(DIR_OUT, "01_matched_senescence_genes.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  data.frame(gene = unmatched_marker),
+  file = file.path(DIR_OUT, "02_unmatched_senescence_genes.csv"),
+  row.names = FALSE
+)
+
+sink(file.path(DIR_OUT, "00_marker_match_summary.txt"))
+cat("Input RDS:", PATH_RDS, "\n")
+cat("Input marker:", PATH_MARKER, "\n")
+cat("Assay used:", ASSAY_USE, "\n")
+cat("Annotation column:", ANNO_COL, "\n")
+cat("Raw marker genes after unique:", length(marker_raw), "\n")
+cat("Matched marker genes:", length(score_genes), "\n")
+cat("Unmatched marker genes:", length(unmatched_marker), "\n")
+cat("Matched ratio:", round(length(score_genes) / length(marker_raw) * 100, 2), "%\n")
+sink()
+
+if (length(score_genes) < 5) {
+  stop("匹配到的衰老 marker 少于 5 个，请检查 marker 文件或基因名格式。")
+}
+
+############################################################
+## 8. AddModuleScore 计算细胞衰老打分
+############################################################
+
+caf_obj <- AddModuleScore(
+  object = caf_obj,
+  features = list(score_genes),
+  assay = ASSAY_USE,
+  name = "Senescence_AddModuleScore",
+  ctrl = 100
+)
+
+score_col <- "Senescence_AddModuleScore1"
+
+if (!(score_col %in% colnames(caf_obj@meta.data))) {
+  stop("AddModuleScore 后没有找到 Senescence_AddModuleScore1")
+}
+
+caf_obj$Senescence_score_raw <- caf_obj[[score_col]][, 1]
+
+############################################################
+## 9. 将衰老分数归一化到 0-1
+############################################################
+
+score_min <- min(caf_obj$Senescence_score_raw, na.rm = TRUE)
+score_max <- max(caf_obj$Senescence_score_raw, na.rm = TRUE)
+
+if (score_max == score_min) {
+  caf_obj$Senescence_score_0_1 <- 0
+} else {
+  caf_obj$Senescence_score_0_1 <- (
+    caf_obj$Senescence_score_raw - score_min
+  ) / (
+    score_max - score_min
+  )
+}
+
+cat("\nAddModuleScore 完成\n")
+cat("原始衰老分数范围：", score_min, " 至 ", score_max, "\n")
+cat("归一化衰老分数范围：", 
+    min(caf_obj$Senescence_score_0_1, na.rm = TRUE), " 至 ",
+    max(caf_obj$Senescence_score_0_1, na.rm = TRUE), "\n\n")
+
+############################################################
+## 10. 输出每个细胞的衰老打分结果
+############################################################
+
+meta_df <- caf_obj@meta.data
+meta_df$cell_barcode <- rownames(meta_df)
+
+keep_cols <- c(
+  "cell_barcode",
+  "orig.ident",
+  "nCount_RNA",
+  "nFeature_RNA",
+  "celltype",
+  "celltype.1st",
+  "celltype.2nd",
+  "seurat_clusters",
+  "CAF_subtype_for_senescence",
+  "Senescence_score_raw",
+  "Senescence_score_0_1"
+)
+
+keep_cols <- intersect(keep_cols, colnames(meta_df))
+
+score_meta <- meta_df[, keep_cols, drop = FALSE]
+
+write.csv(
+  score_meta,
+  file = file.path(DIR_OUT, "03_each_cell_senescence_score.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## 11. 各 CAF 亚型衰老分数统计
+############################################################
+
+score_stat <- score_meta %>%
+  dplyr::filter(!is.na(CAF_subtype_for_senescence)) %>%
+  dplyr::group_by(CAF_subtype_for_senescence) %>%
+  dplyr::summarise(
+    n_cells = dplyr::n(),
+    mean_raw_score = mean(Senescence_score_raw, na.rm = TRUE),
+    median_raw_score = median(Senescence_score_raw, na.rm = TRUE),
+    sd_raw_score = sd(Senescence_score_raw, na.rm = TRUE),
+    mean_score_0_1 = mean(Senescence_score_0_1, na.rm = TRUE),
+    median_score_0_1 = median(Senescence_score_0_1, na.rm = TRUE),
+    sd_score_0_1 = sd(Senescence_score_0_1, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(dplyr::desc(mean_score_0_1))
+
+write.csv(
+  score_stat,
+  file = file.path(DIR_OUT, "04_CAF_subtype_senescence_score_summary.csv"),
+  row.names = FALSE
+)
+
+cat("\n各 CAF 亚型衰老分数统计：\n")
+print(score_stat)
+
+top_subtype <- as.character(score_stat$CAF_subtype_for_senescence[1])
+
+cat("\n平均衰老打分最高的 CAF 亚型是：", top_subtype, "\n")
+
+sink(file.path(DIR_OUT, "04_conclusion_summary.txt"))
+cat("CAF senescence AddModuleScore conclusion\n")
+cat("========================================\n\n")
+cat("Annotation column used:", ANNO_COL, "\n")
+cat("Score column raw: Senescence_score_raw\n")
+cat("Score column normalized: Senescence_score_0_1\n\n")
+cat("Subtype ranking by mean normalized senescence score:\n")
+print(score_stat)
+cat("\nHighest senescence subtype:", top_subtype, "\n")
+if (top_subtype == "apCAF") {
+  cat("\nConclusion: apCAF shows the highest senescence score among CAF subtypes.\n")
+} else {
+  cat("\nWarning: The highest subtype is not apCAF in this run. Please check marker set and data.\n")
+}
+sink()
+
+############################################################
+## 12. 定义高衰老细胞：归一化分数 top 25%
+## 用于统计哪个亚型高衰老细胞比例最多
+############################################################
+
+high_cutoff <- quantile(
+  caf_obj$Senescence_score_0_1,
+  probs = 0.75,
+  na.rm = TRUE
+)
+
+caf_obj$Senescence_high_q75 <- ifelse(
+  caf_obj$Senescence_score_0_1 >= high_cutoff,
+  "High_senescence",
+  "Low_or_mid_senescence"
+)
+
+high_stat <- caf_obj@meta.data %>%
+  dplyr::filter(!is.na(CAF_subtype_for_senescence)) %>%
+  dplyr::group_by(CAF_subtype_for_senescence) %>%
+  dplyr::summarise(
+    total_cells = dplyr::n(),
+    high_senescence_cells = sum(Senescence_high_q75 == "High_senescence", na.rm = TRUE),
+    high_senescence_fraction = high_senescence_cells / total_cells,
+    high_senescence_percent = high_senescence_fraction * 100,
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(dplyr::desc(high_senescence_fraction))
+
+write.csv(
+  high_stat,
+  file = file.path(DIR_OUT, "05_high_senescence_cell_fraction_by_CAF_subtype.csv"),
+  row.names = FALSE
+)
+
+cat("\n高衰老细胞比例统计，阈值为 top 25%：\n")
+print(high_stat)
+
+############################################################
+## 13. 组间统计检验
+## 三组整体：Kruskal-Wallis
+## 两两比较：Wilcoxon rank-sum test
+############################################################
+
+df_score <- caf_obj@meta.data %>%
+  as.data.frame() %>%
+  dplyr::filter(!is.na(CAF_subtype_for_senescence)) %>%
+  dplyr::filter(!is.na(Senescence_score_0_1))
+
+df_score$CAF_subtype_for_senescence <- factor(
+  df_score$CAF_subtype_for_senescence,
+  levels = c("apCAF", "iCAF", "myCAF")
+)
+
+kw_res <- kruskal.test(
+  Senescence_score_0_1 ~ CAF_subtype_for_senescence,
+  data = df_score
+)
+
+pair_list <- list(
+  c("apCAF", "iCAF"),
+  c("apCAF", "myCAF"),
+  c("iCAF", "myCAF")
+)
+
+pair_list <- pair_list[
+  sapply(pair_list, function(x) all(x %in% df_score$CAF_subtype_for_senescence))
+]
+
+pair_res_df <- data.frame()
+
+for (i in seq_along(pair_list)) {
+  g1 <- pair_list[[i]][1]
+  g2 <- pair_list[[i]][2]
+  
+  x1 <- df_score$Senescence_score_0_1[
+    df_score$CAF_subtype_for_senescence == g1
+  ]
+  
+  x2 <- df_score$Senescence_score_0_1[
+    df_score$CAF_subtype_for_senescence == g2
+  ]
+  
+  wt <- wilcox.test(x1, x2, exact = FALSE)
+  
+  pair_res_df <- rbind(
+    pair_res_df,
+    data.frame(
+      group1 = g1,
+      group2 = g2,
+      p_value = wt$p.value
+    )
+  )
+}
+
+pair_res_df$p_adj_BH <- p.adjust(pair_res_df$p_value, method = "BH")
+
+format_p <- function(p) {
+  if (is.na(p)) {
+    return("NA")
+  } else if (p < 0.001) {
+    return("p < 0.001")
+  } else {
+    return(paste0("p = ", signif(p, 3)))
+  }
+}
+
+pair_res_df$p_label <- sapply(pair_res_df$p_adj_BH, format_p)
+
+write.csv(
+  pair_res_df,
+  file = file.path(DIR_OUT, "06_pairwise_Wilcoxon_rank_sum_test.csv"),
+  row.names = FALSE
+)
+
+sink(file.path(DIR_OUT, "06_statistics_test_summary.txt"))
+cat("Kruskal-Wallis test for three CAF subtypes\n")
+print(kw_res)
+cat("\n\nPairwise Wilcoxon rank-sum test, BH adjusted\n")
+print(pair_res_df)
+sink()
+
+cat("\nKruskal-Wallis P value:", kw_res$p.value, "\n")
+cat("\n两两 Wilcoxon 秩和检验：\n")
+print(pair_res_df)
+
+############################################################
+## 14. 箱线图：显示 Wilcoxon 秩和检验 p 值
+############################################################
+
+x_level <- levels(df_score$CAF_subtype_for_senescence)
+x_pos <- setNames(seq_along(x_level), x_level)
+
+pair_res_df$x1 <- x_pos[pair_res_df$group1]
+pair_res_df$x2 <- x_pos[pair_res_df$group2]
+
+## p 值标注放在 1 以上，不影响 0-1 分数本身
+pair_res_df$y <- c(1.04, 1.12, 1.20)[seq_len(nrow(pair_res_df))]
+
+p_box <- ggplot(
+  df_score,
+  aes(
+    x = CAF_subtype_for_senescence,
+    y = Senescence_score_0_1
+  )
+) +
+  geom_boxplot(
+    aes(fill = CAF_subtype_for_senescence),
+    width = 0.6,
+    outlier.shape = NA,
+    alpha = 0.75
+  ) +
+  geom_jitter(
+    aes(color = CAF_subtype_for_senescence),
+    width = 0.15,
+    size = 0.8,
+    alpha = 0.55
+  ) +
+  geom_segment(
+    data = pair_res_df,
+    aes(x = x1, xend = x2, y = y, yend = y),
+    inherit.aes = FALSE,
+    linewidth = 0.4
+  ) +
+  geom_segment(
+    data = pair_res_df,
+    aes(x = x1, xend = x1, y = y - 0.015, yend = y),
+    inherit.aes = FALSE,
+    linewidth = 0.4
+  ) +
+  geom_segment(
+    data = pair_res_df,
+    aes(x = x2, xend = x2, y = y - 0.015, yend = y),
+    inherit.aes = FALSE,
+    linewidth = 0.4
+  ) +
+  geom_text(
+    data = pair_res_df,
+    aes(x = (x1 + x2) / 2, y = y + 0.015, label = p_label),
+    inherit.aes = FALSE,
+    size = 3.5
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1.28),
+    breaks = seq(0, 1, 0.25)
+  ) +
+  scale_fill_manual(
+    values = c(
+      "apCAF" = "#D73027",
+      "iCAF" = "#4575B4",
+      "myCAF" = "#1A9850"
+    )
+  ) +
+  scale_color_manual(
+    values = c(
+      "apCAF" = "#D73027",
+      "iCAF" = "#4575B4",
+      "myCAF" = "#1A9850"
+    )
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 30, hjust = 1),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5)
+  ) +
+  labs(
+    title = "Senescence score across CAF subtypes",
+    subtitle = paste0(
+      "Wilcoxon rank-sum test, BH adjusted; highest mean score: ",
+      top_subtype
+    ),
+    x = "CAF subtype",
+    y = "Senescence AddModuleScore, normalized 0-1"
+  )
+
+ggsave(
+  filename = file.path(DIR_OUT, "07_Boxplot_Senescence_score_0_1_with_Wilcoxon_pvalue.pdf"),
+  plot = p_box,
+  width = 6.5,
+  height = 5.8
+)
+
+ggsave(
+  filename = file.path(DIR_OUT, "07_Boxplot_Senescence_score_0_1_with_Wilcoxon_pvalue.png"),
+  plot = p_box,
+  width = 6.5,
+  height = 5.8,
+  dpi = 300
+)
+
+############################################################
+## 15. UMAP 可视化：衰老分数 0-1 连续标尺
+## 这是主图：适合展示 apCAF 区域衰老更高
+############################################################
+
+if (!("umap" %in% names(caf_obj@reductions))) {
+  stop("对象中没有 umap reduction，无法绘制 UMAP。")
+}
+
+umap_mat <- Embeddings(caf_obj, reduction = "umap")
+
+umap_df <- data.frame(
+  cell_barcode = rownames(umap_mat),
+  UMAP_1 = umap_mat[, 1],
+  UMAP_2 = umap_mat[, 2],
+  CAF_subtype = caf_obj$CAF_subtype_for_senescence,
+  Senescence_score_raw = caf_obj$Senescence_score_raw,
+  Senescence_score_0_1 = caf_obj$Senescence_score_0_1,
+  Senescence_high_q75 = caf_obj$Senescence_high_q75
+)
+
+umap_df <- umap_df[order(umap_df$Senescence_score_0_1), ]
+
+label_df <- umap_df %>%
+  dplyr::group_by(CAF_subtype) %>%
+  dplyr::summarise(
+    UMAP_1 = median(UMAP_1, na.rm = TRUE),
+    UMAP_2 = median(UMAP_2, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+p_umap_score <- ggplot() +
+  geom_point(
+    data = umap_df,
+    aes(x = UMAP_1, y = UMAP_2),
+    color = "grey88",
+    size = 0.75,
+    alpha = 0.7
+  ) +
+  geom_point(
+    data = umap_df,
+    aes(
+      x = UMAP_1,
+      y = UMAP_2,
+      color = Senescence_score_0_1
+    ),
+    size = 1.15,
+    alpha = 0.95
+  ) +
+  geom_label(
+    data = label_df,
+    aes(
+      x = UMAP_1,
+      y = UMAP_2,
+      label = CAF_subtype
+    ),
+    size = 4,
+    fontface = "bold",
+    label.size = 0.25,
+    fill = "white",
+    alpha = 0.9
+  ) +
+  scale_color_gradientn(
+    colors = c(
+      "#313695",
+      "#74ADD1",
+      "#FFFFBF",
+      "#F46D43",
+      "#A50026"
+    ),
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.25),
+    name = "Senescence\nscore\n0-1"
+  ) +
+  theme_void(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "right"
+  ) +
+  labs(
+    title = "UMAP visualization of CAF senescence score",
+    subtitle = paste0(
+      "AddModuleScore normalized to 0-1; highest mean score: ",
+      top_subtype
+    )
+  )
+
+ggsave(
+  filename = file.path(DIR_OUT, "08_UMAP_Senescence_score_0_1_best_visualization.pdf"),
+  plot = p_umap_score,
+  width = 7.2,
+  height = 5.8
+)
+
+ggsave(
+  filename = file.path(DIR_OUT, "08_UMAP_Senescence_score_0_1_best_visualization.png"),
+  plot = p_umap_score,
+  width = 7.2,
+  height = 5.8,
+  dpi = 300
+)
+
+############################################################
+## 16. UMAP 可视化：CAF 亚型原注释
+############################################################
+
+p_umap_subtype <- ggplot(
+  umap_df,
+  aes(
+    x = UMAP_1,
+    y = UMAP_2,
+    color = CAF_subtype
+  )
+) +
+  geom_point(size = 1.1, alpha = 0.9) +
+  geom_label(
+    data = label_df,
+    aes(
+      x = UMAP_1,
+      y = UMAP_2,
+      label = CAF_subtype
+    ),
+    inherit.aes = FALSE,
+    size = 4,
+    fontface = "bold",
+    label.size = 0.25,
+    fill = "white",
+    alpha = 0.9
+  ) +
+  scale_color_manual(
+    values = c(
+      "apCAF" = "#D73027",
+      "iCAF" = "#4575B4",
+      "myCAF" = "#1A9850"
+    )
+  ) +
+  theme_void(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    legend.position = "right"
+  ) +
+  labs(
+    title = "Original CAF subtype annotation",
+    color = "CAF subtype"
+  )
+
+ggsave(
+  filename = file.path(DIR_OUT, "09_UMAP_CAF_subtypes_celltype_2nd.pdf"),
+  plot = p_umap_subtype,
+  width = 7,
+  height = 5.5
+)
+
+ggsave(
+  filename = file.path(DIR_OUT, "09_UMAP_CAF_subtypes_celltype_2nd.png"),
+  plot = p_umap_subtype,
+  width = 7,
+  height = 5.5,
+  dpi = 300
+)
+
+############################################################
+## 17. UMAP 高衰老细胞突出图
+## top 25% 衰老分数细胞高亮
+############################################################
+
+p_umap_high <- ggplot() +
+  geom_point(
+    data = umap_df,
+    aes(x = UMAP_1, y = UMAP_2),
+    color = "grey85",
+    size = 0.8,
+    alpha = 0.7
+  ) +
+  geom_point(
+    data = umap_df %>% dplyr::filter(Senescence_high_q75 == "High_senescence"),
+    aes(
+      x = UMAP_1,
+      y = UMAP_2,
+      color = CAF_subtype
+    ),
+    size = 1.4,
+    alpha = 0.95
+  ) +
+  geom_label(
+    data = label_df,
+    aes(
+      x = UMAP_1,
+      y = UMAP_2,
+      label = CAF_subtype
+    ),
+    size = 4,
+    fontface = "bold",
+    label.size = 0.25,
+    fill = "white",
+    alpha = 0.9
+  ) +
+  scale_color_manual(
+    values = c(
+      "apCAF" = "#D73027",
+      "iCAF" = "#4575B4",
+      "myCAF" = "#1A9850"
+    )
+  ) +
+  theme_void(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "right"
+  ) +
+  labs(
+    title = "High-senescence CAFs on UMAP",
+    subtitle = "Highlighted cells: top 25% normalized senescence score",
+    color = "CAF subtype"
+  )
+
+ggsave(
+  filename = file.path(DIR_OUT, "10_UMAP_High_senescence_top25_cells.pdf"),
+  plot = p_umap_high,
+  width = 7,
+  height = 5.5
+)
+
+ggsave(
+  filename = file.path(DIR_OUT, "10_UMAP_High_senescence_top25_cells.png"),
+  plot = p_umap_high,
+  width = 7,
+  height = 5.5,
+  dpi = 300
+)
+
+############################################################
+## 18. 高衰老细胞比例柱状图
+############################################################
+
+p_bar_high <- ggplot(
+  high_stat,
+  aes(
+    x = CAF_subtype_for_senescence,
+    y = high_senescence_percent,
+    fill = CAF_subtype_for_senescence
+  )
+) +
+  geom_col(width = 0.65, alpha = 0.85) +
+  geom_text(
+    aes(label = paste0(round(high_senescence_percent, 1), "%")),
+    vjust = -0.4,
+    size = 4
+  ) +
+  scale_fill_manual(
+    values = c(
+      "apCAF" = "#D73027",
+      "iCAF" = "#4575B4",
+      "myCAF" = "#1A9850"
+    )
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 30, hjust = 1),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5)
+  ) +
+  labs(
+    title = "Fraction of high-senescence CAFs",
+    subtitle = "High-senescence cells defined as top 25% normalized score",
+    x = "CAF subtype",
+    y = "High-senescence cells (%)"
+  )
+
+ggsave(
+  filename = file.path(DIR_OUT, "11_Barplot_High_senescence_fraction_by_CAF_subtype.pdf"),
+  plot = p_bar_high,
+  width = 5.8,
+  height = 5
+)
+
+ggsave(
+  filename = file.path(DIR_OUT, "11_Barplot_High_senescence_fraction_by_CAF_subtype.png"),
+  plot = p_bar_high,
+  width = 5.8,
+  height = 5,
+  dpi = 300
+)
+
+############################################################
+## 19. 保存带衰老分数的新 Seurat 对象
+############################################################
+
+saveRDS(
+  caf_obj,
+  file = file.path(DIR_OUT, "CAF_Subtypes_Annotated_with_Senescence_AddModuleScore.rds")
+)
+
+############################################################
+## 20. 完成
+############################################################
+
+cat("\n全部完成！\n")
+cat("输出目录：", DIR_OUT, "\n\n")
+
+cat("重点输出文件：\n")
+cat("03_each_cell_senescence_score.csv\n")
+cat("04_CAF_subtype_senescence_score_summary.csv\n")
+cat("05_high_senescence_cell_fraction_by_CAF_subtype.csv\n")
+cat("06_pairwise_Wilcoxon_rank_sum_test.csv\n")
+cat("07_Boxplot_Senescence_score_0_1_with_Wilcoxon_pvalue.pdf/png\n")
+cat("08_UMAP_Senescence_score_0_1_best_visualization.pdf/png\n")
+cat("10_UMAP_High_senescence_top25_cells.pdf/png\n")
+cat("CAF_Subtypes_Annotated_with_Senescence_AddModuleScore.rds\n\n")
+
+cat("最终结论：平均衰老打分最高的 CAF 亚型是：", top_subtype, "\n")
+
+if (top_subtype == "apCAF") {
+  cat("结论符合预期：apCAF 中细胞衰老程度最高。\n")
+} else {
+  cat("注意：本次运行中最高亚型不是 apCAF，请检查 marker 或数据。\n")
+}
