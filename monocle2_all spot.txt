@@ -1,0 +1,2161 @@
+############################################################
+## 鼻咽癌空间转录组 Monocle2 拟时序分析
+## 严格 QC + 新 marker + 自然分化轨迹版本
+##
+## 输入：
+## L: /media/desk16/iy2142/鼻咽癌L_output_final2/outs
+## R: /media/desk16/iy2142/鼻咽癌R_output_final2/outs
+## marker:
+## /media/desk16/iy2142/鼻咽癌课题/空间转录组marker整理.xlsx
+##
+## 输出：
+## /media/desk16/iy2142/鼻咽癌课题/01_拟时序
+############################################################
+
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+set.seed(123)
+
+############################################################
+## 0. 路径
+############################################################
+
+L_OUTS <- "/media/desk16/iy2142/鼻咽癌L_output_final2/outs"
+R_OUTS <- "/media/desk16/iy2142/鼻咽癌R_output_final2/outs"
+
+CLIN_DIR <- "/media/desk16/iy2142/鼻咽癌课题/临床性状矩阵/鼻咽癌"
+
+L_HNAS_FILE <- file.path(CLIN_DIR, "HNas_N091Su01_L.csv")
+R_HNAS_FILE <- file.path(CLIN_DIR, "HNas_N091Su01_R.csv")
+
+DIFF_FILE <- file.path(CLIN_DIR, "HNasN091Su01临床数据_ver1_分化.xlsx")
+T_FILE    <- file.path(CLIN_DIR, "HNasN091Su01临床数据_ver2_T.xlsx")
+N_FILE    <- file.path(CLIN_DIR, "HNasN091Su01临床数据_ver3_N.xlsx")
+REC_FILE  <- file.path(CLIN_DIR, "HNasN091Su01临床数据_ver4_复发.xlsx")
+
+MARKER_XLSX <- "/media/desk16/iy2142/鼻咽癌课题/空间转录组marker整理.xlsx"
+
+OUTDIR <- "/media/desk16/iy2142/鼻咽癌课题/01_拟时序"
+
+DIR_RDS   <- file.path(OUTDIR, "00_Robject")
+DIR_TAB   <- file.path(OUTDIR, "01_tables")
+DIR_QC    <- file.path(OUTDIR, "02_QC_figures")
+DIR_FIG   <- file.path(OUTDIR, "03_single_figures")
+DIR_COMP  <- file.path(OUTDIR, "04_composite_figures")
+DIR_HEAT  <- file.path(OUTDIR, "05_heatmaps")
+DIR_XLSX  <- file.path(OUTDIR, "06_excel")
+
+dir.create(DIR_RDS, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_TAB, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_QC, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_FIG, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_COMP, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_HEAT, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_XLSX, recursive = TRUE, showWarnings = FALSE)
+
+############################################################
+## 1. 参数
+############################################################
+
+SAMPLE_L <- "HNasN091Su01_L"
+SAMPLE_R <- "HNasN091Su01_R"
+
+USE_IN_TISSUE_ONLY <- TRUE
+
+## 严格 QC 参数
+MIN_UMI <- 300
+MIN_FEATURE <- 200
+MAX_PERCENT_MT <- 20
+
+## L/R 内部去极端值，避免异常 spot 拉出非自然分支
+USE_SECTION_QUANTILE_QC <- TRUE
+NCOUNT_LOW_Q <- 0.01
+NCOUNT_HIGH_Q <- 0.995
+NFEATURE_LOW_Q <- 0.01
+NFEATURE_HIGH_Q <- 0.995
+
+MIN_QC_SPOTS <- 2500
+
+## Monocle2
+LOWER_DETECTION_LIMIT <- 0.5
+DETECT_MIN_EXPR <- 0.1
+
+## ordering genes：严格表达过滤，降低噪声和技术分支
+N_ORDERING_GENES <- 1600
+ORDERING_MEAN_EXPR_MIN <- 0.10
+ORDERING_DETECT_RATE_MIN <- 0.03
+ORDERING_DETECT_RATE_MAX <- 0.85
+
+EXCLUDE_BAD_GENE_REGEX <- "^(MT-|RPL|RPS|HB[ABDEGQM]|IG[HKL]|TR[ABDG][VCJ]|MALAT1$|XIST$|HIST|MIR|SNORD|SNORA|KRTAP)"
+
+## 是否把 tumor-Epithelials marker 替换成文献 epithelial marker
+OVERRIDE_TUMOR_EPITHELIAL_WITH_LITERATURE <- TRUE
+
+LITERATURE_TUMOR_EPITHELIAL_GENES <- c(
+  "CD24",
+  "KRT19",
+  "EPCAM",
+  "KRT18",
+  "KRT5"
+)
+
+## 单基因检查
+SINGLE_GENES <- c("CDK4", "MKI67", "PCNA")
+
+## 颜色：沿用最后一次更连续的过渡方案
+PSEUDOTIME_COLORS_B <- c(
+  "#313695",
+  "#1E88E5",
+  "#00ACC1",
+  "#43A047",
+  "#C0CA33",
+  "#FFD54F",
+  "#FB8C00",
+  "#E53935",
+  "#7F0000"
+)
+
+PSEUDOTIME_VALUES_B <- c(
+  0.00,
+  0.08,
+  0.16,
+  0.28,
+  0.42,
+  0.56,
+  0.72,
+  0.88,
+  1.00
+)
+
+MODULE_LOW <- "#2166AC"
+MODULE_MID <- "#F7F7F7"
+MODULE_HIGH <- "#B2182B"
+BACKGROUND_GREY <- "grey90"
+
+POINT_SIZE <- 0.36
+POINT_ALPHA <- 0.90
+EDGE_SIZE <- 0.35
+EDGE_ALPHA <- 0.75
+
+N_PSEUDOTIME_BINS <- 60
+CLIP_MODULE_Z <- 2.5
+
+############################################################
+## 2. 加载包
+############################################################
+
+need_pkgs <- c(
+  "Seurat",
+  "Matrix",
+  "monocle",
+  "VGAM",
+  "Biobase",
+  "dplyr",
+  "tidyr",
+  "ggplot2",
+  "scales",
+  "patchwork",
+  "openxlsx",
+  "readxl"
+)
+
+for (p in need_pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    stop("缺少 R 包：", p, "。请先安装后再运行。")
+  }
+}
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Matrix)
+  library(monocle)
+  library(VGAM)
+  library(Biobase)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(scales)
+  library(patchwork)
+  library(openxlsx)
+  library(readxl)
+})
+
+select    <- dplyr::select
+filter    <- dplyr::filter
+mutate    <- dplyr::mutate
+arrange   <- dplyr::arrange
+distinct  <- dplyr::distinct
+left_join <- dplyr::left_join
+bind_rows <- dplyr::bind_rows
+group_by  <- dplyr::group_by
+summarise <- dplyr::summarise
+ungroup   <- dplyr::ungroup
+case_when <- dplyr::case_when
+count     <- dplyr::count
+
+############################################################
+## 3. 函数
+############################################################
+
+safe_z <- function(x) {
+  x <- as.numeric(x)
+  out <- rep(NA_real_, length(x))
+  ok <- is.finite(x)
+
+  if (sum(ok) == 0) return(out)
+
+  m <- mean(x[ok], na.rm = TRUE)
+  s <- sd(x[ok], na.rm = TRUE)
+
+  if (!is.finite(s) || s == 0) {
+    out[ok] <- 0
+  } else {
+    out[ok] <- (x[ok] - m) / s
+  }
+
+  out
+}
+
+minmax_01 <- function(x) {
+  x <- as.numeric(x)
+  out <- rep(NA_real_, length(x))
+  ok <- is.finite(x)
+
+  if (sum(ok) == 0) return(out)
+
+  mn <- min(x[ok], na.rm = TRUE)
+  mx <- max(x[ok], na.rm = TRUE)
+
+  if (!is.finite(mx - mn) || mx == mn) {
+    out[ok] <- 0
+  } else {
+    out[ok] <- (x[ok] - mn) / (mx - mn)
+  }
+
+  out
+}
+
+clean_gene_key <- function(x) {
+  x <- toupper(as.character(x))
+  x <- trimws(x)
+  x <- gsub("\\s+", "", x)
+  x <- gsub("[^A-Z0-9\\-]", "", x)
+  x
+}
+
+sanitize_name <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x <- gsub("[\r\n\t]+", " ", x)
+  x <- gsub("\\s+", "_", x)
+  x <- gsub("[^A-Za-z0-9_]", "_", x)
+  x <- gsub("_+", "_", x)
+  x <- gsub("^_|_$", "", x)
+  ifelse(x == "", "module", x)
+}
+
+make_key <- function(x) {
+  x <- as.character(x)
+  x <- basename(x)
+  x <- trimws(x)
+  x <- gsub("\\s+", "", x)
+  x <- gsub("\"", "", x)
+  x <- gsub("'", "", x)
+  toupper(x)
+}
+
+barcode_core <- function(x) {
+  x <- make_key(x)
+  x <- gsub("^HNASN091SU01_L_", "", x)
+  x <- gsub("^HNASN091SU01_R_", "", x)
+  x <- gsub("^L_", "", x)
+  x <- gsub("^R_", "", x)
+  x <- gsub("-[0-9]+$", "", x)
+  x
+}
+
+make_spot_id <- function(barcode, sample_id) {
+  paste0(sample_id, "_", as.character(barcode))
+}
+
+dedup_genes_keep_high_mean <- function(mat) {
+  gene <- rownames(mat)
+  if (!anyDuplicated(gene)) return(mat)
+
+  gene_mean <- Matrix::rowMeans(mat)
+
+  df <- data.frame(
+    gene = gene,
+    idx = seq_along(gene),
+    mean_expr = as.numeric(gene_mean),
+    stringsAsFactors = FALSE
+  ) %>%
+    arrange(gene, desc(mean_expr)) %>%
+    distinct(gene, .keep_all = TRUE)
+
+  mat2 <- mat[df$idx, , drop = FALSE]
+  rownames(mat2) <- df$gene
+
+  mat2
+}
+
+merge_sparse_by_gene <- function(mat_list) {
+  all_genes <- unique(unlist(lapply(mat_list, rownames)))
+  all_cells <- unlist(lapply(mat_list, colnames))
+
+  out_list <- lapply(mat_list, function(m) {
+    miss <- setdiff(all_genes, rownames(m))
+
+    if (length(miss) > 0) {
+      zero <- Matrix::Matrix(
+        0,
+        nrow = length(miss),
+        ncol = ncol(m),
+        sparse = TRUE,
+        dimnames = list(miss, colnames(m))
+      )
+
+      m <- rbind(m, zero)
+    }
+
+    m[all_genes, , drop = FALSE]
+  })
+
+  merged <- do.call(cbind, out_list)
+  merged[, all_cells, drop = FALSE]
+}
+
+read_counts_from_outs <- function(outs_dir, sample_id) {
+  h5_filtered <- file.path(outs_dir, "filtered_feature_bc_matrix.h5")
+  mtx_filtered <- file.path(outs_dir, "filtered_feature_bc_matrix")
+  h5_raw <- file.path(outs_dir, "raw_feature_bc_matrix.h5")
+
+  if (file.exists(h5_filtered)) {
+    message("读取 filtered h5：", h5_filtered)
+    counts <- Seurat::Read10X_h5(h5_filtered)
+  } else if (dir.exists(mtx_filtered)) {
+    message("读取 filtered mtx：", mtx_filtered)
+    counts <- Seurat::Read10X(mtx_filtered)
+  } else if (file.exists(h5_raw)) {
+    message("读取 raw h5：", h5_raw)
+    counts <- Seurat::Read10X_h5(h5_raw)
+  } else {
+    stop("找不到表达矩阵：", outs_dir)
+  }
+
+  if (is.list(counts)) {
+    if ("Gene Expression" %in% names(counts)) {
+      counts <- counts[["Gene Expression"]]
+    } else {
+      counts <- counts[[1]]
+    }
+  }
+
+  counts <- as(counts, "dgCMatrix")
+  colnames(counts) <- make_spot_id(colnames(counts), sample_id)
+
+  counts
+}
+
+read_spatial_positions <- function(outs_dir, sample_id) {
+  spatial_dir <- file.path(outs_dir, "spatial")
+
+  f1 <- file.path(spatial_dir, "tissue_positions.csv")
+  f2 <- file.path(spatial_dir, "tissue_positions_list.csv")
+
+  if (file.exists(f1)) {
+    pos <- read.csv(f1, stringsAsFactors = FALSE, check.names = FALSE)
+  } else if (file.exists(f2)) {
+    pos <- read.csv(f2, header = FALSE, stringsAsFactors = FALSE, check.names = FALSE)
+    colnames(pos) <- c(
+      "barcode",
+      "in_tissue",
+      "array_row",
+      "array_col",
+      "pxl_row_in_fullres",
+      "pxl_col_in_fullres"
+    )
+  } else {
+    stop("找不到空间坐标文件：", spatial_dir)
+  }
+
+  if (!"barcode" %in% colnames(pos)) colnames(pos)[1] <- "barcode"
+  if (!"in_tissue" %in% colnames(pos)) pos$in_tissue <- 1
+  if (!"array_row" %in% colnames(pos)) pos$array_row <- NA_real_
+  if (!"array_col" %in% colnames(pos)) pos$array_col <- NA_real_
+
+  if (!"pxl_row_in_fullres" %in% colnames(pos) ||
+      !"pxl_col_in_fullres" %in% colnames(pos)) {
+    if (all(c("array_row", "array_col") %in% colnames(pos))) {
+      pos$pxl_row_in_fullres <- pos$array_row
+      pos$pxl_col_in_fullres <- pos$array_col
+    } else {
+      stop("空间坐标文件缺少像素坐标：", spatial_dir)
+    }
+  }
+
+  pos %>%
+    mutate(
+      spot_id = make_spot_id(barcode, sample_id),
+      sample_id = sample_id,
+      sample_short = ifelse(sample_id == SAMPLE_L, "L", "R"),
+      barcode_core = barcode_core(barcode),
+      in_tissue = as.numeric(in_tissue),
+      array_row = as.numeric(array_row),
+      array_col = as.numeric(array_col),
+      pxl_row_in_fullres = as.numeric(pxl_row_in_fullres),
+      pxl_col_in_fullres = as.numeric(pxl_col_in_fullres)
+    ) %>%
+    distinct(spot_id, .keep_all = TRUE)
+}
+
+read_hnas_map <- function(file, sample_short) {
+  if (!file.exists(file)) stop("找不到 HNas 对照文件：", file)
+
+  df <- read.csv(file, stringsAsFactors = FALSE, check.names = FALSE)
+
+  if (!"Barcode" %in% colnames(df)) colnames(df)[1] <- "Barcode"
+  if (!"HNas" %in% colnames(df)) colnames(df)[2] <- "HNas"
+
+  df %>%
+    mutate(
+      sample_short = sample_short,
+      barcode_core = barcode_core(Barcode),
+      HNas_code = toupper(trimws(as.character(HNas))),
+      circle_id = paste0(sample_short, "_", HNas_code)
+    ) %>%
+    filter(
+      !is.na(barcode_core),
+      barcode_core != "",
+      !is.na(HNas_code),
+      HNas_code != ""
+    ) %>%
+    distinct(sample_short, barcode_core, .keep_all = TRUE) %>%
+    select(sample_short, barcode_core, HNas_code, circle_id)
+}
+
+read_clinical3 <- function(file, trait_name) {
+  if (!file.exists(file)) {
+    warning("临床文件不存在，跳过：", file)
+    return(data.frame(HNas_code = character(0)))
+  }
+
+  df <- as.data.frame(readxl::read_excel(file, col_names = FALSE))
+
+  if (ncol(df) < 3) {
+    warning("临床文件列数不足，跳过：", file)
+    return(data.frame(HNas_code = character(0)))
+  }
+
+  df <- df[, 1:3]
+  colnames(df) <- c("HNas_code", "patient_id_tmp", trait_name)
+
+  df %>%
+    mutate(
+      HNas_code = toupper(trimws(as.character(HNas_code))),
+      !!trait_name := trimws(as.character(.data[[trait_name]]))
+    ) %>%
+    filter(
+      !is.na(HNas_code),
+      HNas_code != ""
+    ) %>%
+    select(HNas_code, all_of(trait_name)) %>%
+    distinct(HNas_code, .keep_all = TRUE)
+}
+
+read_marker_modules_from_excel <- function(file) {
+  if (!file.exists(file)) stop("marker 文件不存在：", file)
+
+  sheets <- readxl::excel_sheets(file)
+
+  all_modules <- list()
+  all_meta <- data.frame()
+
+  for (sh in sheets) {
+    raw <- tryCatch(
+      as.data.frame(readxl::read_excel(file, sheet = sh, col_names = FALSE)),
+      error = function(e) NULL
+    )
+
+    if (is.null(raw) || nrow(raw) == 0 || ncol(raw) == 0) next
+
+    raw <- raw[, colSums(!is.na(raw)) > 0, drop = FALSE]
+
+    if (nrow(raw) == 0 || ncol(raw) == 0) next
+
+    first_row <- as.character(unlist(raw[1, ]))
+    first_row[is.na(first_row)] <- ""
+    header_cols <- which(trimws(first_row) != "")
+
+    if (length(header_cols) >= 2) {
+      for (i in header_cols) {
+        label <- trimws(as.character(raw[1, i]))
+        module_id <- sanitize_name(label)
+
+        genes <- raw[-1, i, drop = TRUE]
+        genes <- as.character(genes)
+        genes <- trimws(genes)
+        genes <- genes[!is.na(genes) & genes != ""]
+        genes <- unique(genes)
+
+        if (length(genes) == 0) next
+
+        if (module_id %in% names(all_modules)) {
+          module_id <- paste0(module_id, "_", sanitize_name(sh))
+        }
+
+        all_modules[[module_id]] <- genes
+
+        all_meta <- bind_rows(
+          all_meta,
+          data.frame(
+            sheet = sh,
+            module_id = module_id,
+            module_label = label,
+            input_gene = genes,
+            stringsAsFactors = FALSE
+          )
+        )
+      }
+    }
+
+    if (length(header_cols) < 2) {
+      genes <- as.character(unlist(raw))
+      genes <- trimws(genes)
+      genes <- genes[!is.na(genes) & genes != ""]
+      genes <- genes[!genes %in% c("gene", "Gene", "GENE", "marker", "Marker", "MARKER")]
+      genes <- unique(genes)
+
+      if (length(genes) > 0) {
+        module_id <- sanitize_name(sh)
+        label <- sh
+
+        if (module_id %in% names(all_modules)) {
+          module_id <- paste0(module_id, "_sheet")
+        }
+
+        all_modules[[module_id]] <- genes
+
+        all_meta <- bind_rows(
+          all_meta,
+          data.frame(
+            sheet = sh,
+            module_id = module_id,
+            module_label = label,
+            input_gene = genes,
+            stringsAsFactors = FALSE
+          )
+        )
+      }
+    }
+  }
+
+  if (length(all_modules) == 0) {
+    stop("marker Excel 没有读到任何模块。请检查文件格式。")
+  }
+
+  list(
+    modules = all_modules,
+    module_meta = all_meta
+  )
+}
+
+get_mono_fun <- function(fname) {
+  if (exists(fname, envir = asNamespace("monocle"), inherits = FALSE)) {
+    return(get(fname, envir = asNamespace("monocle")))
+  }
+
+  if (exists(fname, mode = "function")) {
+    return(get(fname, mode = "function"))
+  }
+
+  stop("找不到 Monocle2 函数：", fname)
+}
+
+get_nb_family <- function() {
+  tryCatch(
+    VGAM::negbinomial.size(),
+    error = function(e) {
+      f <- get("negbinomial.size", envir = asNamespace("VGAM"))
+      f()
+    }
+  )
+}
+
+get_reduced_df <- function(cds) {
+  rd <- tryCatch(monocle::reducedDimS(cds), error = function(e) NULL)
+
+  if (is.null(rd) && "reducedDimS" %in% slotNames(cds)) {
+    rd <- slot(cds, "reducedDimS")
+  }
+
+  if (is.null(rd)) stop("无法提取 reducedDimS。")
+
+  cell_ids <- Biobase::sampleNames(cds)
+
+  if (nrow(rd) >= 2 && ncol(rd) == length(cell_ids)) {
+    data.frame(
+      spot_id = cell_ids,
+      Component_1 = as.numeric(rd[1, ]),
+      Component_2 = as.numeric(rd[2, ]),
+      stringsAsFactors = FALSE
+    )
+  } else if (ncol(rd) >= 2 && nrow(rd) == length(cell_ids)) {
+    data.frame(
+      spot_id = cell_ids,
+      Component_1 = as.numeric(rd[, 1]),
+      Component_2 = as.numeric(rd[, 2]),
+      stringsAsFactors = FALSE
+    )
+  } else {
+    stop("reducedDimS 维度无法识别。")
+  }
+}
+
+extract_edge_df_from_cds_plot <- function(cds) {
+  p <- tryCatch(
+    monocle::plot_cell_trajectory(cds, color_by = "State"),
+    error = function(e) NULL
+  )
+
+  if (is.null(p)) return(data.frame())
+
+  gb <- ggplot2::ggplot_build(p)
+
+  segs <- lapply(gb$data, function(d) {
+    if (all(c("x", "y", "xend", "yend") %in% colnames(d))) {
+      d[, c("x", "y", "xend", "yend"), drop = FALSE]
+    } else {
+      NULL
+    }
+  })
+
+  segs <- segs[!vapply(segs, is.null, logical(1))]
+
+  if (length(segs) == 0) return(data.frame())
+
+  bind_rows(segs) %>% distinct()
+}
+
+score_one_module <- function(log_expr, genes, module_id, module_label) {
+  genes0 <- unique(as.character(genes))
+  genes0 <- trimws(genes0)
+  genes0 <- genes0[!is.na(genes0) & genes0 != ""]
+
+  genes_key <- clean_gene_key(genes0)
+  genes_key <- unique(genes_key)
+  genes_key <- genes_key[genes_key != ""]
+
+  hit <- intersect(genes_key, rownames(log_expr))
+  miss <- setdiff(genes_key, hit)
+
+  match_df <- data.frame(
+    module_id = module_id,
+    module_label = module_label,
+    input_gene = genes0,
+    input_gene_key = clean_gene_key(genes0),
+    matched = clean_gene_key(genes0) %in% hit,
+    stringsAsFactors = FALSE
+  )
+
+  if (length(hit) < 2) {
+    raw_score <- rep(NA_real_, ncol(log_expr))
+    z_score <- rep(NA_real_, ncol(log_expr))
+    names(raw_score) <- colnames(log_expr)
+    names(z_score) <- colnames(log_expr)
+  } else {
+    mat <- as.matrix(log_expr[hit, , drop = FALSE])
+    mat_z <- t(apply(mat, 1, safe_z))
+    mat_z[!is.finite(mat_z)] <- 0
+
+    raw_score <- colMeans(mat_z, na.rm = TRUE)
+    z_score <- safe_z(raw_score)
+
+    names(raw_score) <- colnames(log_expr)
+    names(z_score) <- colnames(log_expr)
+  }
+
+  list(
+    module_id = module_id,
+    module_label = module_label,
+    input_genes = genes0,
+    matched_genes = hit,
+    missing_genes = miss,
+    raw_score = raw_score,
+    z_score = z_score,
+    match_df = match_df
+  )
+}
+
+theme_mono_panel <- function(base_size = 9) {
+  theme_classic(base_size = base_size) +
+    theme(
+      text = element_text(color = "black"),
+      axis.text = element_text(color = "black", size = base_size - 1),
+      axis.title = element_text(color = "black", size = base_size),
+      axis.line = element_line(color = "black", linewidth = 0.35),
+      axis.ticks = element_line(color = "black", linewidth = 0.25),
+      plot.title = element_text(face = "bold", color = "black", size = base_size + 3),
+      plot.subtitle = element_text(color = "grey35", size = base_size - 1),
+      legend.title = element_text(color = "black", size = base_size - 1),
+      legend.text = element_text(color = "black", size = base_size - 2),
+      legend.key.height = unit(0.35, "cm"),
+      legend.key.width = unit(0.25, "cm"),
+      plot.background = element_rect(fill = "white", color = NA),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.margin = margin(5, 8, 5, 5)
+    )
+}
+
+theme_trend <- function(base_size = 10) {
+  theme_classic(base_size = base_size) +
+    theme(
+      text = element_text(color = "black"),
+      axis.text = element_text(color = "black"),
+      axis.title = element_text(color = "black"),
+      plot.title = element_text(face = "bold", color = "black", size = base_size + 4),
+      plot.subtitle = element_text(color = "grey35", size = base_size),
+      plot.background = element_rect(fill = "white", color = NA),
+      panel.background = element_rect(fill = "white", color = NA)
+    )
+}
+
+theme_heat <- function(base_size = 10) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      text = element_text(color = "black"),
+      axis.text.x = element_text(color = "black", angle = 45, hjust = 1),
+      axis.text.y = element_text(color = "black"),
+      axis.title = element_text(color = "black"),
+      panel.grid = element_blank(),
+      plot.title = element_text(face = "bold", color = "black", size = base_size + 4),
+      plot.subtitle = element_text(color = "grey35", size = base_size),
+      plot.background = element_rect(fill = "white", color = NA),
+      panel.background = element_rect(fill = "white", color = NA)
+    )
+}
+
+add_edge_layer <- function(p, edge_df) {
+  if (is.null(edge_df) || !is.data.frame(edge_df) || nrow(edge_df) == 0) return(p)
+
+  if (all(c("x", "y", "xend", "yend") %in% colnames(edge_df))) {
+    p <- p +
+      geom_segment(
+        data = edge_df,
+        aes(x = x, y = y, xend = xend, yend = yend),
+        inherit.aes = FALSE,
+        color = "black",
+        linewidth = EDGE_SIZE,
+        alpha = EDGE_ALPHA
+      )
+  }
+
+  p
+}
+
+save_pdf_png <- function(p, name, width = 10, height = 7, outdir = DIR_FIG) {
+  pdf_file <- file.path(outdir, paste0(name, ".pdf"))
+  png_file <- file.path(outdir, paste0(name, ".png"))
+
+  ggsave(pdf_file, p, width = width, height = height, bg = "white", limitsize = FALSE)
+  ggsave(png_file, p, width = width, height = height, dpi = 320, bg = "white", limitsize = FALSE)
+
+  message("[PDF] ", pdf_file)
+  message("[PNG] ", png_file)
+}
+
+############################################################
+## 4. 读取 marker
+############################################################
+
+marker_obj <- read_marker_modules_from_excel(MARKER_XLSX)
+module_list <- marker_obj$modules
+module_meta_original <- marker_obj$module_meta
+module_meta <- module_meta_original
+
+if (OVERRIDE_TUMOR_EPITHELIAL_WITH_LITERATURE) {
+  tumor_module_ids <- grep(
+    pattern = "tumor|epithelial|epithelials",
+    x = names(module_list),
+    ignore.case = TRUE,
+    value = TRUE
+  )
+
+  if (length(tumor_module_ids) == 0) {
+    tumor_module_ids <- "Tumor_Epithelial_literature_marker"
+    module_list[[tumor_module_ids]] <- LITERATURE_TUMOR_EPITHELIAL_GENES
+  } else {
+    for (tmid in tumor_module_ids) {
+      module_list[[tmid]] <- LITERATURE_TUMOR_EPITHELIAL_GENES
+    }
+  }
+
+  module_meta <- module_meta %>%
+    filter(!module_id %in% tumor_module_ids)
+
+  tumor_meta_new <- lapply(tumor_module_ids, function(tmid) {
+    data.frame(
+      sheet = "literature_override",
+      module_id = tmid,
+      module_label = "Tumor-Epithelial literature marker",
+      input_gene = LITERATURE_TUMOR_EPITHELIAL_GENES,
+      marker_source_title = "Single-cell resolution profiling of the immune microenvironment in primary and metastatic nasopharyngeal carcinoma",
+      marker_source_doi = "10.1007/s00432-024-05900-5",
+      stringsAsFactors = FALSE
+    )
+  }) %>%
+    bind_rows()
+
+  module_meta <- bind_rows(module_meta, tumor_meta_new)
+}
+
+write.csv(
+  module_meta_original,
+  file.path(DIR_TAB, "00A_marker_modules_from_excel_original.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  module_meta,
+  file.path(DIR_TAB, "00B_marker_modules_used_after_tumor_override.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  data.frame(
+    marker_type = "Tumor-Epithelial literature marker",
+    gene = LITERATURE_TUMOR_EPITHELIAL_GENES,
+    source_title = "Single-cell resolution profiling of the immune microenvironment in primary and metastatic nasopharyngeal carcinoma",
+    source_doi = "10.1007/s00432-024-05900-5",
+    stringsAsFactors = FALSE
+  ),
+  file.path(DIR_TAB, "00C_literature_tumor_epithelial_marker_used.csv"),
+  row.names = FALSE
+)
+
+module_labels <- sapply(names(module_list), function(mid) {
+  x <- unique(module_meta$module_label[module_meta$module_id == mid])
+  if (length(x) == 0 || is.na(x[1]) || x[1] == "") mid else x[1]
+})
+
+message("marker 模块数：", length(module_list))
+print(names(module_list))
+
+############################################################
+## 5. 读取 SpaceRanger 原始数据
+############################################################
+
+message("========== 读取 SpaceRanger counts ==========")
+
+L_counts <- read_counts_from_outs(L_OUTS, SAMPLE_L)
+R_counts <- read_counts_from_outs(R_OUTS, SAMPLE_R)
+
+L_counts <- dedup_genes_keep_high_mean(L_counts)
+R_counts <- dedup_genes_keep_high_mean(R_counts)
+
+counts_all <- merge_sparse_by_gene(list(L_counts, R_counts))
+counts_all <- dedup_genes_keep_high_mean(counts_all)
+
+message("合并 counts：", nrow(counts_all), " genes x ", ncol(counts_all), " spots")
+
+message("========== 读取空间坐标 ==========")
+
+L_pos <- read_spatial_positions(L_OUTS, SAMPLE_L)
+R_pos <- read_spatial_positions(R_OUTS, SAMPLE_R)
+pos_all <- bind_rows(L_pos, R_pos)
+
+message("========== 读取 HNas / 临床信息 ==========")
+
+L_hnas <- read_hnas_map(L_HNAS_FILE, "L")
+R_hnas <- read_hnas_map(R_HNAS_FILE, "R")
+hnas_map <- bind_rows(L_hnas, R_hnas)
+
+clin_diff <- read_clinical3(DIFF_FILE, "分化")
+clin_T    <- read_clinical3(T_FILE, "T分期")
+clin_N    <- read_clinical3(N_FILE, "N原始")
+clin_rec  <- read_clinical3(REC_FILE, "复发")
+
+clin_all <- full_join(clin_diff, clin_T, by = "HNas_code") %>%
+  full_join(clin_N, by = "HNas_code") %>%
+  full_join(clin_rec, by = "HNas_code")
+
+write.csv(hnas_map, file.path(DIR_TAB, "01_HNas_barcode_mapping.csv"), row.names = FALSE)
+write.csv(clin_all, file.path(DIR_TAB, "02_HNas_clinical_traits_merged.csv"), row.names = FALSE)
+
+############################################################
+## 6. metadata + 严格 QC
+############################################################
+
+message("========== 构建 metadata ==========")
+
+meta <- data.frame(
+  spot_id = colnames(counts_all),
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    sample_id = case_when(
+      grepl("^HNasN091Su01_L_", spot_id) ~ SAMPLE_L,
+      grepl("^HNasN091Su01_R_", spot_id) ~ SAMPLE_R,
+      TRUE ~ NA_character_
+    ),
+    sample_short = case_when(
+      grepl("^HNasN091Su01_L_", spot_id) ~ "L",
+      grepl("^HNasN091Su01_R_", spot_id) ~ "R",
+      TRUE ~ NA_character_
+    ),
+    barcode_core = barcode_core(spot_id)
+  ) %>%
+  left_join(
+    pos_all %>%
+      select(
+        spot_id,
+        barcode,
+        in_tissue,
+        array_row,
+        array_col,
+        pxl_row_in_fullres,
+        pxl_col_in_fullres
+      ),
+    by = "spot_id"
+  ) %>%
+  left_join(
+    hnas_map,
+    by = c("sample_short", "barcode_core")
+  ) %>%
+  left_join(
+    clin_all,
+    by = "HNas_code"
+  )
+
+meta$nCount_RNA <- as.numeric(Matrix::colSums(counts_all[, meta$spot_id, drop = FALSE]))
+meta$nFeature_RNA <- as.numeric(Matrix::colSums(counts_all[, meta$spot_id, drop = FALSE] > 0))
+
+mt_genes <- grep("^MT-", rownames(counts_all), value = TRUE, ignore.case = FALSE)
+
+if (length(mt_genes) > 0) {
+  meta$percent_mt <- as.numeric(Matrix::colSums(counts_all[mt_genes, meta$spot_id, drop = FALSE])) /
+    pmax(meta$nCount_RNA, 1) * 100
+} else {
+  meta$percent_mt <- 0
+}
+
+meta <- meta %>%
+  mutate(
+    cancer_type = "Nasopharyngeal carcinoma",
+    N分组_统一 = case_when(
+      is.na(N原始) ~ NA_character_,
+      N原始 %in% c("无", "N0", "0", "阴性") ~ "N0",
+      TRUE ~ "N_positive"
+    ),
+    T早晚分组 = case_when(
+      T分期 %in% c("T1", "T2") ~ "T_early",
+      T分期 %in% c("T3", "T4") ~ "T_late",
+      TRUE ~ NA_character_
+    )
+  )
+
+write.csv(meta, file.path(DIR_TAB, "03_metadata_before_strict_QC.csv"), row.names = FALSE)
+
+meta_qc <- meta %>%
+  filter(
+    !is.na(sample_short),
+    !is.na(pxl_row_in_fullres),
+    !is.na(pxl_col_in_fullres),
+    !is.na(HNas_code),
+    nCount_RNA >= MIN_UMI,
+    nFeature_RNA >= MIN_FEATURE,
+    percent_mt <= MAX_PERCENT_MT
+  )
+
+if (USE_IN_TISSUE_ONLY) {
+  meta_qc <- meta_qc %>%
+    filter(is.na(in_tissue) | in_tissue == 1)
+}
+
+if (USE_SECTION_QUANTILE_QC) {
+  meta_qc <- meta_qc %>%
+    group_by(sample_short) %>%
+    mutate(
+      nCount_low_cut = as.numeric(quantile(nCount_RNA, NCOUNT_LOW_Q, na.rm = TRUE)),
+      nCount_high_cut = as.numeric(quantile(nCount_RNA, NCOUNT_HIGH_Q, na.rm = TRUE)),
+      nFeature_low_cut = as.numeric(quantile(nFeature_RNA, NFEATURE_LOW_Q, na.rm = TRUE)),
+      nFeature_high_cut = as.numeric(quantile(nFeature_RNA, NFEATURE_HIGH_Q, na.rm = TRUE))
+    ) %>%
+    ungroup() %>%
+    filter(
+      nCount_RNA >= nCount_low_cut,
+      nCount_RNA <= nCount_high_cut,
+      nFeature_RNA >= nFeature_low_cut,
+      nFeature_RNA <= nFeature_high_cut
+    )
+}
+
+meta_qc <- meta_qc %>%
+  arrange(spot_id)
+
+if (nrow(meta_qc) < MIN_QC_SPOTS) {
+  stop("严格 QC 后 spots 太少：", nrow(meta_qc), "。请适当放宽 QC 参数。")
+}
+
+counts_qc <- counts_all[, meta_qc$spot_id, drop = FALSE]
+
+qc_summary <- data.frame(
+  item = c(
+    "n_raw_genes",
+    "n_raw_spots",
+    "n_QC_spots",
+    "use_in_tissue_only",
+    "min_umi",
+    "min_feature",
+    "max_percent_mt",
+    "section_quantile_qc",
+    "nCount_low_q",
+    "nCount_high_q",
+    "nFeature_low_q",
+    "nFeature_high_q"
+  ),
+  value = c(
+    nrow(counts_all),
+    ncol(counts_all),
+    nrow(meta_qc),
+    USE_IN_TISSUE_ONLY,
+    MIN_UMI,
+    MIN_FEATURE,
+    MAX_PERCENT_MT,
+    USE_SECTION_QUANTILE_QC,
+    NCOUNT_LOW_Q,
+    NCOUNT_HIGH_Q,
+    NFEATURE_LOW_Q,
+    NFEATURE_HIGH_Q
+  ),
+  stringsAsFactors = FALSE
+)
+
+section_qc_summary <- meta_qc %>%
+  count(sample_short, name = "n_spots") %>%
+  mutate(percent = n_spots / sum(n_spots) * 100)
+
+write.csv(meta_qc, file.path(DIR_TAB, "04_metadata_after_strict_QC.csv"), row.names = FALSE)
+write.csv(qc_summary, file.path(DIR_TAB, "05_strict_QC_summary.csv"), row.names = FALSE)
+write.csv(section_qc_summary, file.path(DIR_TAB, "06_section_summary_after_strict_QC.csv"), row.names = FALSE)
+
+message("严格 QC 后 spots：", nrow(meta_qc))
+print(section_qc_summary)
+
+############################################################
+## 7. QC 图
+############################################################
+
+p_qc1 <- ggplot(meta, aes(nCount_RNA)) +
+  geom_histogram(bins = 80, color = "white") +
+  theme_classic(base_size = 11) +
+  labs(title = "Before strict QC | nCount_RNA", x = "nCount_RNA", y = "Spot count")
+
+p_qc2 <- ggplot(meta_qc, aes(nCount_RNA)) +
+  geom_histogram(bins = 80, color = "white") +
+  theme_classic(base_size = 11) +
+  labs(title = "After strict QC | nCount_RNA", x = "nCount_RNA", y = "Spot count")
+
+p_qc3 <- ggplot(meta_qc, aes(sample_short, nCount_RNA)) +
+  geom_boxplot(outlier.size = 0.25) +
+  theme_classic(base_size = 11) +
+  labs(title = "After strict QC | nCount_RNA by section", x = "Section", y = "nCount_RNA")
+
+p_qc4 <- ggplot(meta_qc, aes(sample_short, nFeature_RNA)) +
+  geom_boxplot(outlier.size = 0.25) +
+  theme_classic(base_size = 11) +
+  labs(title = "After strict QC | nFeature_RNA by section", x = "Section", y = "nFeature_RNA")
+
+p_qc5 <- ggplot(meta_qc, aes(sample_short, percent_mt)) +
+  geom_boxplot(outlier.size = 0.25) +
+  theme_classic(base_size = 11) +
+  labs(title = "After strict QC | percent.mt by section", x = "Section", y = "percent.mt")
+
+fig_qc <- (p_qc1 | p_qc2) / (p_qc3 | p_qc4) / p_qc5 +
+  patchwork::plot_annotation(
+    title = "Strict QC overview for Monocle2 input",
+    subtitle = paste0("Final trajectory spots = ", nrow(meta_qc))
+  )
+
+save_pdf_png(fig_qc, "Figure_QC_01_strict_QC_overview", width = 12, height = 13, outdir = DIR_QC)
+
+############################################################
+## 8. log-normalize + marker module scoring
+############################################################
+
+message("========== log-normalize and module scoring ==========")
+
+lib_size <- Matrix::colSums(counts_qc)
+lib_size[lib_size == 0] <- 1
+
+norm_counts <- t(t(counts_qc) / lib_size * 10000)
+log_expr_qc <- norm_counts
+log_expr_qc@x <- log1p(log_expr_qc@x)
+
+rownames(log_expr_qc) <- clean_gene_key(rownames(log_expr_qc))
+log_expr_qc <- dedup_genes_keep_high_mean(log_expr_qc)
+
+rm(norm_counts)
+gc()
+
+score_res <- lapply(names(module_list), function(mid) {
+  score_one_module(
+    log_expr = log_expr_qc,
+    genes = module_list[[mid]],
+    module_id = mid,
+    module_label = module_labels[[mid]]
+  )
+})
+names(score_res) <- names(module_list)
+
+match_table <- bind_rows(lapply(score_res, function(x) x$match_df))
+
+match_summary <- bind_rows(lapply(score_res, function(x) {
+  data.frame(
+    module_id = x$module_id,
+    module_label = x$module_label,
+    n_input_genes = length(unique(clean_gene_key(x$input_genes))),
+    n_matched_genes = length(x$matched_genes),
+    n_missing_genes = length(x$missing_genes),
+    matched_genes = paste(x$matched_genes, collapse = ";"),
+    missing_genes = paste(x$missing_genes, collapse = ";"),
+    match_rate = ifelse(
+      length(unique(clean_gene_key(x$input_genes))) == 0,
+      NA_real_,
+      length(x$matched_genes) / length(unique(clean_gene_key(x$input_genes)))
+    ),
+    stringsAsFactors = FALSE
+  )
+}))
+
+score_df <- data.frame(
+  spot_id = meta_qc$spot_id,
+  stringsAsFactors = FALSE
+)
+
+for (mid in names(score_res)) {
+  raw_col <- paste0(mid, "__raw")
+  z_col <- paste0(mid, "__z")
+
+  score_df[[raw_col]] <- as.numeric(score_res[[mid]]$raw_score[meta_qc$spot_id])
+  score_df[[z_col]] <- as.numeric(score_res[[mid]]$z_score[meta_qc$spot_id])
+}
+
+single_gene_df <- data.frame(
+  spot_id = meta_qc$spot_id,
+  stringsAsFactors = FALSE
+)
+
+single_gene_match <- data.frame()
+
+for (g in SINGLE_GENES) {
+  gkey <- clean_gene_key(g)
+  matched <- gkey %in% rownames(log_expr_qc)
+
+  if (matched) {
+    expr_raw <- as.numeric(log_expr_qc[gkey, meta_qc$spot_id])
+    expr_z <- safe_z(expr_raw)
+  } else {
+    expr_raw <- rep(NA_real_, nrow(meta_qc))
+    expr_z <- rep(NA_real_, nrow(meta_qc))
+  }
+
+  score_df[[paste0(gkey, "__expr")]] <- expr_raw
+  score_df[[paste0(gkey, "__z")]] <- expr_z
+  single_gene_df[[paste0(gkey, "__expr")]] <- expr_raw
+  single_gene_df[[paste0(gkey, "__z")]] <- expr_z
+
+  single_gene_match <- bind_rows(
+    single_gene_match,
+    data.frame(gene = g, gene_key = gkey, matched = matched, stringsAsFactors = FALSE)
+  )
+}
+
+meta_qc <- meta_qc %>%
+  left_join(score_df, by = "spot_id")
+
+write.csv(match_table, file.path(DIR_TAB, "07_module_gene_match_table.csv"), row.names = FALSE)
+write.csv(match_summary, file.path(DIR_TAB, "08_module_gene_match_summary.csv"), row.names = FALSE)
+write.csv(score_df, file.path(DIR_TAB, "09_module_and_single_gene_score_by_spot.csv"), row.names = FALSE)
+write.csv(single_gene_match, file.path(DIR_TAB, "10_single_gene_CDK4_MKI67_PCNA_match.csv"), row.names = FALSE)
+
+############################################################
+## 9. 构建自然进展轴用于方向判定
+############################################################
+
+module_ids <- names(module_list)
+
+advanced_ids <- grep(
+  "ECM|SASP|senescence|senescent|derived_ECM|derived_SASP",
+  module_ids,
+  ignore.case = TRUE,
+  value = TRUE
+)
+
+early_ids <- grep(
+  "presenescence|other|iCAF|apCAF",
+  module_ids,
+  ignore.case = TRUE,
+  value = TRUE
+)
+
+tumor_ids <- grep(
+  "tumor|epithelial|epithelials",
+  module_ids,
+  ignore.case = TRUE,
+  value = TRUE
+)
+
+advanced_z_cols <- paste0(advanced_ids, "__z")
+advanced_z_cols <- advanced_z_cols[advanced_z_cols %in% colnames(meta_qc)]
+
+early_z_cols <- paste0(early_ids, "__z")
+early_z_cols <- early_z_cols[early_z_cols %in% colnames(meta_qc)]
+
+tumor_z_cols <- paste0(tumor_ids, "__z")
+tumor_z_cols <- tumor_z_cols[tumor_z_cols %in% colnames(meta_qc)]
+
+if (length(advanced_z_cols) == 0) {
+  advanced_z_cols <- grep("__z$", colnames(meta_qc), value = TRUE)
+  advanced_z_cols <- setdiff(advanced_z_cols, paste0(clean_gene_key(SINGLE_GENES), "__z"))
+}
+
+meta_qc$advanced_remodeling_axis <- if (length(advanced_z_cols) > 0) {
+  rowMeans(as.matrix(meta_qc[, advanced_z_cols, drop = FALSE]), na.rm = TRUE)
+} else {
+  0
+}
+
+meta_qc$early_marker_axis <- if (length(early_z_cols) > 0) {
+  rowMeans(as.matrix(meta_qc[, early_z_cols, drop = FALSE]), na.rm = TRUE)
+} else {
+  0
+}
+
+meta_qc$tumor_epithelial_axis <- if (length(tumor_z_cols) > 0) {
+  rowMeans(as.matrix(meta_qc[, tumor_z_cols, drop = FALSE]), na.rm = TRUE)
+} else {
+  0
+}
+
+meta_qc$natural_progression_axis <- safe_z(meta_qc$advanced_remodeling_axis) +
+  0.35 * safe_z(meta_qc$tumor_epithelial_axis) -
+  0.20 * safe_z(meta_qc$early_marker_axis)
+
+write.csv(
+  meta_qc,
+  file.path(DIR_TAB, "11_metadata_after_marker_scoring_and_axes.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  data.frame(
+    axis = c(
+      rep("advanced_remodeling_axis", length(advanced_z_cols)),
+      rep("early_marker_axis", length(early_z_cols)),
+      rep("tumor_epithelial_axis", length(tumor_z_cols))
+    ),
+    score_column = c(advanced_z_cols, early_z_cols, tumor_z_cols),
+    stringsAsFactors = FALSE
+  ),
+  file.path(DIR_TAB, "12_axis_score_columns_used.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## 10. 构建 Monocle2 CDS
+############################################################
+
+message("========== 构建 Monocle2 CDS ==========")
+
+counts_traj <- counts_qc[, meta_qc$spot_id, drop = FALSE]
+
+mono_newCellDataSet <- get_mono_fun("newCellDataSet")
+mono_estimateSizeFactors <- get_mono_fun("estimateSizeFactors")
+mono_estimateDispersions <- get_mono_fun("estimateDispersions")
+mono_detectGenes <- get_mono_fun("detectGenes")
+mono_dispersionTable <- get_mono_fun("dispersionTable")
+mono_setOrderingFilter <- get_mono_fun("setOrderingFilter")
+mono_reduceDimension <- get_mono_fun("reduceDimension")
+mono_orderCells <- get_mono_fun("orderCells")
+
+pd <- meta_qc
+rownames(pd) <- pd$spot_id
+
+fd <- data.frame(
+  gene_short_name = rownames(counts_traj),
+  stringsAsFactors = FALSE
+)
+rownames(fd) <- rownames(counts_traj)
+
+cds <- mono_newCellDataSet(
+  counts_traj,
+  phenoData = Biobase::AnnotatedDataFrame(data = pd),
+  featureData = Biobase::AnnotatedDataFrame(data = fd),
+  lowerDetectionLimit = LOWER_DETECTION_LIMIT,
+  expressionFamily = get_nb_family()
+)
+
+message("estimateSizeFactors...")
+cds <- mono_estimateSizeFactors(cds)
+
+message("estimateDispersions...")
+cds <- mono_estimateDispersions(cds)
+
+message("detectGenes...")
+cds <- mono_detectGenes(cds, min_expr = DETECT_MIN_EXPR)
+
+message("CDS：", nrow(cds), " genes x ", ncol(cds), " spots")
+
+############################################################
+## 11. 严格选择 ordering genes
+############################################################
+
+message("========== 选择 ordering genes ==========")
+
+disp_tbl <- mono_dispersionTable(cds)
+
+gene_detect <- Matrix::rowSums(counts_traj > 0)
+
+detect_df <- data.frame(
+  gene_id = names(gene_detect),
+  n_cells_expressed = as.numeric(gene_detect),
+  detect_rate = as.numeric(gene_detect) / ncol(counts_traj),
+  stringsAsFactors = FALSE
+)
+
+ordering_tbl <- disp_tbl %>%
+  left_join(detect_df, by = "gene_id") %>%
+  mutate(
+    extra_dispersion = dispersion_empirical - dispersion_fit,
+    bad_gene = grepl(EXCLUDE_BAD_GENE_REGEX, gene_id, ignore.case = TRUE)
+  ) %>%
+  filter(
+    is.finite(mean_expression),
+    mean_expression >= ORDERING_MEAN_EXPR_MIN,
+    detect_rate >= ORDERING_DETECT_RATE_MIN,
+    detect_rate <= ORDERING_DETECT_RATE_MAX,
+    dispersion_empirical >= dispersion_fit,
+    !bad_gene
+  ) %>%
+  arrange(desc(extra_dispersion))
+
+if (nrow(ordering_tbl) < 300) {
+  warning("严格 ordering gene 过滤后少于 300，自动放宽 mean_expression 到 0.05，detect_rate 到 0.02。")
+
+  ordering_tbl <- disp_tbl %>%
+    left_join(detect_df, by = "gene_id") %>%
+    mutate(
+      extra_dispersion = dispersion_empirical - dispersion_fit,
+      bad_gene = grepl(EXCLUDE_BAD_GENE_REGEX, gene_id, ignore.case = TRUE)
+    ) %>%
+    filter(
+      is.finite(mean_expression),
+      mean_expression >= 0.05,
+      detect_rate >= 0.02,
+      detect_rate <= 0.90,
+      dispersion_empirical >= dispersion_fit,
+      !bad_gene
+    ) %>%
+    arrange(desc(extra_dispersion))
+}
+
+ordering_genes <- ordering_tbl$gene_id[
+  seq_len(min(N_ORDERING_GENES, nrow(ordering_tbl)))
+]
+
+if (length(ordering_genes) < 200) {
+  stop("ordering genes 太少：", length(ordering_genes))
+}
+
+write.csv(disp_tbl, file.path(DIR_TAB, "13_all_dispersion_table.csv"), row.names = FALSE)
+write.csv(ordering_tbl, file.path(DIR_TAB, "14_ordering_gene_candidates_strict.csv"), row.names = FALSE)
+write.csv(
+  data.frame(ordering_gene = ordering_genes),
+  file.path(DIR_TAB, "15_ordering_genes_used_strict.csv"),
+  row.names = FALSE
+)
+
+cds <- mono_setOrderingFilter(cds, ordering_genes)
+
+############################################################
+## 12. DDRTree + 默认 orderCells
+############################################################
+
+message("========== DDRTree ==========")
+
+cds <- tryCatch(
+  {
+    mono_reduceDimension(
+      cds,
+      max_components = 2,
+      reduction_method = "DDRTree",
+      norm_method = "log",
+      pseudo_expr = 1,
+      verbose = TRUE
+    )
+  },
+  error = function(e1) {
+    message("reduction_method 参数失败，尝试 method='DDRTree'。原错误：", e1$message)
+
+    mono_reduceDimension(
+      cds,
+      max_components = 2,
+      method = "DDRTree",
+      norm_method = "log",
+      pseudo_expr = 1,
+      verbose = TRUE
+    )
+  }
+)
+
+message("========== 默认 orderCells ==========")
+
+cds <- mono_orderCells(cds)
+
+############################################################
+## 13. 提取轨迹并自然方向校正
+############################################################
+
+plot_df <- get_reduced_df(cds) %>%
+  left_join(
+    as.data.frame(Biobase::pData(cds)) %>%
+      mutate(spot_id = rownames(.)),
+    by = "spot_id"
+  )
+
+plot_df$State <- as.factor(plot_df$State)
+
+edge_df <- extract_edge_df_from_cds_plot(cds)
+
+state_root_summary <- plot_df %>%
+  group_by(State) %>%
+  summarise(
+    n_spots = n(),
+    mean_pseudotime_raw = mean(Pseudotime, na.rm = TRUE),
+    median_pseudotime_raw = median(Pseudotime, na.rm = TRUE),
+    mean_natural_progression = mean(natural_progression_axis, na.rm = TRUE),
+    mean_advanced_axis = mean(advanced_remodeling_axis, na.rm = TRUE),
+    mean_early_axis = mean(early_marker_axis, na.rm = TRUE),
+    mean_tumor_axis = mean(tumor_epithelial_axis, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    root_score =
+      -1.20 * safe_z(mean_natural_progression) -
+      0.80 * safe_z(mean_advanced_axis) +
+      0.25 * safe_z(mean_early_axis) +
+      0.10 * safe_z(n_spots)
+  ) %>%
+  arrange(desc(root_score))
+
+root_state_selected <- as.character(state_root_summary$State[1])
+
+root_pt <- plot_df$Pseudotime[
+  as.character(plot_df$State) == root_state_selected
+]
+
+root_median_pt <- median(root_pt, na.rm = TRUE)
+overall_median_pt <- median(plot_df$Pseudotime, na.rm = TRUE)
+
+pt_use <- plot_df$Pseudotime
+
+reverse_by_root <- is.finite(root_median_pt) &&
+  is.finite(overall_median_pt) &&
+  root_median_pt > overall_median_pt
+
+if (reverse_by_root) {
+  pt_use <- max(pt_use, na.rm = TRUE) - pt_use
+}
+
+cor_pt_axis_after_root <- suppressWarnings(
+  cor(
+    pt_use,
+    plot_df$natural_progression_axis,
+    method = "spearman",
+    use = "complete.obs"
+  )
+)
+
+reverse_by_axis <- FALSE
+
+if (
+  !reverse_by_root &&
+  is.finite(cor_pt_axis_after_root) &&
+  cor_pt_axis_after_root < -0.05
+) {
+  pt_use <- max(pt_use, na.rm = TRUE) - pt_use
+  reverse_by_axis <- TRUE
+}
+
+plot_df$Pseudotime_raw_monocle <- plot_df$Pseudotime
+plot_df$Pseudotime_final <- pt_use
+plot_df$Pseudotime_0_1 <- minmax_01(plot_df$Pseudotime_final)
+plot_df$root_state_selected <- root_state_selected
+plot_df$pseudotime_direction_method <- case_when(
+  reverse_by_root ~ "manual_reverse_by_root_state",
+  reverse_by_axis ~ "manual_reverse_by_natural_progression_axis",
+  TRUE ~ "default_monocle_direction_kept"
+)
+
+write.csv(state_root_summary, file.path(DIR_TAB, "16_state_root_candidate_summary.csv"), row.names = FALSE)
+write.csv(plot_df, file.path(DIR_TAB, "17_monocle2_plot_df_with_scores.csv"), row.names = FALSE)
+write.csv(edge_df, file.path(DIR_TAB, "18_monocle2_edge_segments.csv"), row.names = FALSE)
+
+############################################################
+## 14. 画图函数
+############################################################
+
+xlim_use <- range(plot_df$Component_1, na.rm = TRUE)
+ylim_use <- range(plot_df$Component_2, na.rm = TRUE)
+
+plot_pseudotime <- function(df) {
+  p <- ggplot(df, aes(Component_1, Component_2)) +
+    geom_point(
+      aes(color = Pseudotime_0_1),
+      size = POINT_SIZE,
+      alpha = POINT_ALPHA
+    ) +
+    scale_color_gradientn(
+      colors = PSEUDOTIME_COLORS_B,
+      values = PSEUDOTIME_VALUES_B,
+      limits = c(0, 1),
+      oob = scales::squish,
+      name = "Pseudotime\n0-1"
+    ) +
+    coord_cartesian(xlim = xlim_use, ylim = ylim_use) +
+    theme_mono_panel() +
+    labs(
+      title = "A | Strict-QC Monocle2 pseudotime trajectory",
+      subtitle = paste0(
+        "root_state = ",
+        root_state_selected,
+        "; direction = ",
+        unique(plot_df$pseudotime_direction_method)[1]
+      ),
+      x = "Component 1",
+      y = "Component 2"
+    )
+
+  add_edge_layer(p, edge_df)
+}
+
+plot_discrete <- function(df, col_use, title, subtitle, legend_title) {
+  if (!col_use %in% colnames(df)) {
+    return(ggplot() + theme_void() + labs(title = title, subtitle = paste("Missing:", col_use)))
+  }
+
+  dd <- df %>%
+    filter(!is.na(.data[[col_use]]))
+
+  p <- ggplot(dd, aes(Component_1, Component_2)) +
+    geom_point(
+      aes(color = factor(.data[[col_use]])),
+      size = POINT_SIZE,
+      alpha = POINT_ALPHA
+    ) +
+    coord_cartesian(xlim = xlim_use, ylim = ylim_use) +
+    theme_mono_panel() +
+    labs(
+      title = title,
+      subtitle = subtitle,
+      color = legend_title,
+      x = "Component 1",
+      y = "Component 2"
+    )
+
+  add_edge_layer(p, edge_df)
+}
+
+plot_continuous <- function(df, col_use, title, subtitle, legend_title) {
+  if (!col_use %in% colnames(df)) {
+    return(ggplot() + theme_void() + labs(title = title, subtitle = paste("Missing:", col_use)))
+  }
+
+  fg <- df %>%
+    filter(is.finite(.data[[col_use]]))
+
+  z_use <- fg[[col_use]]
+  lim <- suppressWarnings(quantile(abs(z_use), 0.98, na.rm = TRUE))
+
+  if (!is.finite(lim) || lim <= 0) lim <- 1
+  lim <- max(1, min(CLIP_MODULE_Z, lim))
+
+  p <- ggplot() +
+    geom_point(
+      data = df,
+      aes(Component_1, Component_2),
+      color = BACKGROUND_GREY,
+      size = POINT_SIZE,
+      alpha = 0.55
+    ) +
+    geom_point(
+      data = fg,
+      aes(Component_1, Component_2, color = .data[[col_use]]),
+      size = POINT_SIZE,
+      alpha = POINT_ALPHA
+    ) +
+    scale_color_gradient2(
+      low = MODULE_LOW,
+      mid = MODULE_MID,
+      high = MODULE_HIGH,
+      midpoint = 0,
+      limits = c(-lim, lim),
+      oob = scales::squish,
+      na.value = BACKGROUND_GREY,
+      name = legend_title
+    ) +
+    coord_cartesian(xlim = xlim_use, ylim = ylim_use) +
+    theme_mono_panel() +
+    labs(
+      title = title,
+      subtitle = subtitle,
+      x = "Component 1",
+      y = "Component 2"
+    )
+
+  add_edge_layer(p, edge_df)
+}
+
+plot_module_on_trajectory <- function(mid) {
+  z_col <- paste0(mid, "__z")
+  mlab <- module_labels[[mid]]
+
+  n_match <- match_summary$n_matched_genes[match_summary$module_id == mid]
+  n_input <- match_summary$n_input_genes[match_summary$module_id == mid]
+
+  plot_continuous(
+    plot_df,
+    z_col,
+    mlab,
+    paste0("Matched genes: ", n_match, " / ", n_input),
+    "Module\nz-score"
+  )
+}
+
+############################################################
+## 15. 主图
+############################################################
+
+pA <- plot_pseudotime(plot_df)
+
+pB <- plot_discrete(
+  plot_df,
+  "State",
+  "B | Monocle2 State",
+  "State labels from strict-QC trajectory",
+  "State"
+)
+
+pC <- plot_discrete(
+  plot_df,
+  "sample_short",
+  "C | L/R section",
+  "Section distribution on trajectory",
+  "Section"
+)
+
+pD <- plot_continuous(
+  plot_df,
+  "natural_progression_axis",
+  "D | Natural progression axis",
+  "Advanced remodeling/tumor axis used only for direction check",
+  "Axis\nz-score"
+)
+
+pE <- plot_continuous(
+  plot_df,
+  "advanced_remodeling_axis",
+  "E | Advanced remodeling axis",
+  "ECM/SASP/senescence-like modules",
+  "Axis\nz-score"
+)
+
+pF <- plot_continuous(
+  plot_df,
+  "tumor_epithelial_axis",
+  "F | Tumor epithelial axis",
+  "Literature tumor epithelial marker if available",
+  "Axis\nz-score"
+)
+
+fig_main <- (pA | pB | pC) / (pD | pE | pF) +
+  patchwork::plot_annotation(
+    title = "NPC strict-QC Monocle2 trajectory rebuilt from raw SpaceRanger counts",
+    subtitle = "All strict-QC tissue spots; new marker file; stricter ordering-gene filter; natural direction correction",
+    theme = theme(
+      plot.title = element_text(face = "bold", size = 18, color = "black"),
+      plot.subtitle = element_text(size = 11, color = "grey30")
+    )
+  )
+
+save_pdf_png(
+  fig_main,
+  "Figure_01_strictQC_Monocle2_main_board",
+  width = 18,
+  height = 10,
+  outdir = DIR_COMP
+)
+
+save_pdf_png(pA, "Figure_01A_strictQC_pseudotime", width = 6.2, height = 4.8, outdir = DIR_FIG)
+save_pdf_png(pB, "Figure_01B_strictQC_state", width = 6.2, height = 4.8, outdir = DIR_FIG)
+save_pdf_png(pC, "Figure_01C_strictQC_section", width = 6.2, height = 4.8, outdir = DIR_FIG)
+save_pdf_png(pD, "Figure_01D_natural_progression_axis", width = 6.2, height = 4.8, outdir = DIR_FIG)
+save_pdf_png(pE, "Figure_01E_advanced_remodeling_axis", width = 6.2, height = 4.8, outdir = DIR_FIG)
+save_pdf_png(pF, "Figure_01F_tumor_epithelial_axis", width = 6.2, height = 4.8, outdir = DIR_FIG)
+
+############################################################
+## 16. 所有模块轨迹图
+############################################################
+
+module_plots <- list()
+
+for (mid in names(module_list)) {
+  p <- plot_module_on_trajectory(mid)
+  module_plots[[mid]] <- p
+
+  save_pdf_png(
+    p,
+    paste0("ModuleTrajectory_", mid),
+    width = 6.2,
+    height = 4.8,
+    outdir = DIR_FIG
+  )
+}
+
+module_ids <- names(module_plots)
+chunks <- split(module_ids, ceiling(seq_along(module_ids) / 8))
+
+for (i in seq_along(chunks)) {
+  ids <- chunks[[i]]
+
+  fig <- patchwork::wrap_plots(c(list(pA), module_plots[ids]), ncol = 3) +
+    patchwork::plot_annotation(
+      title = paste0("Marker module scores on strict-QC trajectory - page ", i),
+      subtitle = "Pseudotime uses continuous transition colors; module scores use blue-white-red",
+      theme = theme(
+        plot.title = element_text(face = "bold", size = 18, color = "black"),
+        plot.subtitle = element_text(size = 11, color = "grey30")
+      )
+    )
+
+  save_pdf_png(
+    fig,
+    paste0("Figure_02_module_trajectory_board_page_", sprintf("%02d", i)),
+    width = 18,
+    height = 14,
+    outdir = DIR_COMP
+  )
+}
+
+############################################################
+## 17. CDK4 / MKI67 / PCNA
+############################################################
+
+single_gene_plots <- list()
+
+for (g in SINGLE_GENES) {
+  gkey <- clean_gene_key(g)
+  z_col <- paste0(gkey, "__z")
+
+  p <- plot_continuous(
+    plot_df,
+    z_col,
+    paste0(gkey, " expression"),
+    "Single-gene z-score on strict-QC trajectory",
+    "Gene\nz-score"
+  )
+
+  single_gene_plots[[gkey]] <- p
+
+  save_pdf_png(
+    p,
+    paste0("SingleGeneTrajectory_", gkey),
+    width = 6.2,
+    height = 4.8,
+    outdir = DIR_FIG
+  )
+}
+
+fig_single_gene <- (pA | single_gene_plots[["CDK4"]]) /
+  (single_gene_plots[["MKI67"]] | single_gene_plots[["PCNA"]]) +
+  patchwork::plot_annotation(
+    title = "CDK4 / MKI67 / PCNA expression on strict-QC Monocle2 trajectory",
+    subtitle = "Single-gene z-score based on log-normalized expression",
+    theme = theme(
+      plot.title = element_text(face = "bold", size = 18, color = "black"),
+      plot.subtitle = element_text(size = 11, color = "grey30")
+    )
+  )
+
+save_pdf_png(
+  fig_single_gene,
+  "Figure_03_CDK4_MKI67_PCNA_trajectory_board",
+  width = 12.5,
+  height = 10,
+  outdir = DIR_COMP
+)
+
+############################################################
+## 18. 趋势与热图
+############################################################
+
+module_score_cols <- paste0(names(module_list), "__z")
+module_score_cols <- module_score_cols[module_score_cols %in% colnames(plot_df)]
+
+plot_df$pseudotime_bin <- cut(
+  plot_df$Pseudotime_0_1,
+  breaks = seq(0, 1, length.out = N_PSEUDOTIME_BINS + 1),
+  include.lowest = TRUE,
+  labels = FALSE
+)
+
+long_score_df <- lapply(names(module_list), function(mid) {
+  z_col <- paste0(mid, "__z")
+
+  data.frame(
+    spot_id = plot_df$spot_id,
+    Pseudotime_0_1 = plot_df$Pseudotime_0_1,
+    pseudotime_bin = plot_df$pseudotime_bin,
+    State = plot_df$State,
+    module_id = mid,
+    module_label = module_labels[[mid]],
+    score_z = plot_df[[z_col]],
+    stringsAsFactors = FALSE
+  )
+}) %>%
+  bind_rows()
+
+trend_bin_df <- long_score_df %>%
+  filter(
+    is.finite(Pseudotime_0_1),
+    is.finite(score_z),
+    !is.na(pseudotime_bin)
+  ) %>%
+  group_by(module_id, module_label, pseudotime_bin) %>%
+  summarise(
+    n_spots = n(),
+    pseudotime_mean = mean(Pseudotime_0_1, na.rm = TRUE),
+    score_mean = mean(score_z, na.rm = TRUE),
+    score_median = median(score_z, na.rm = TRUE),
+    score_sd = sd(score_z, na.rm = TRUE),
+    score_se = score_sd / sqrt(n_spots),
+    .groups = "drop"
+  )
+
+cor_df <- lapply(names(module_list), function(mid) {
+  z_col <- paste0(mid, "__z")
+  x <- plot_df$Pseudotime_0_1
+  y <- plot_df[[z_col]]
+  ok <- is.finite(x) & is.finite(y)
+
+  if (sum(ok) < 10) {
+    return(
+      data.frame(
+        module_id = mid,
+        module_label = module_labels[[mid]],
+        n_spots = sum(ok),
+        spearman_rho = NA_real_,
+        spearman_p = NA_real_,
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+
+  sp <- suppressWarnings(cor.test(x[ok], y[ok], method = "spearman", exact = FALSE))
+
+  data.frame(
+    module_id = mid,
+    module_label = module_labels[[mid]],
+    n_spots = sum(ok),
+    spearman_rho = as.numeric(sp$estimate),
+    spearman_p = sp$p.value,
+    stringsAsFactors = FALSE
+  )
+}) %>%
+  bind_rows() %>%
+  mutate(
+    spearman_FDR = p.adjust(spearman_p, method = "BH"),
+    trend_direction = case_when(
+      is.na(spearman_rho) ~ "NA",
+      spearman_rho > 0 ~ "increase_along_pseudotime",
+      spearman_rho < 0 ~ "decrease_along_pseudotime",
+      TRUE ~ "flat"
+    )
+  ) %>%
+  arrange(desc(abs(spearman_rho)))
+
+write.csv(long_score_df, file.path(DIR_TAB, "19_module_score_long_by_spot.csv"), row.names = FALSE)
+write.csv(trend_bin_df, file.path(DIR_TAB, "20_module_score_pseudotime_bin_trend.csv"), row.names = FALSE)
+write.csv(cor_df, file.path(DIR_TAB, "21_module_score_vs_pseudotime_correlation.csv"), row.names = FALSE)
+
+plot_one_trend <- function(mid) {
+  mlab <- module_labels[[mid]]
+
+  dd_point <- long_score_df %>%
+    filter(module_id == mid, is.finite(score_z), is.finite(Pseudotime_0_1))
+
+  dd_bin <- trend_bin_df %>%
+    filter(module_id == mid)
+
+  rho <- cor_df$spearman_rho[cor_df$module_id == mid]
+  fdr <- cor_df$spearman_FDR[cor_df$module_id == mid]
+
+  ggplot() +
+    geom_point(
+      data = dd_point,
+      aes(Pseudotime_0_1, score_z),
+      size = 0.25,
+      alpha = 0.10,
+      color = "grey45"
+    ) +
+    geom_ribbon(
+      data = dd_bin,
+      aes(
+        x = pseudotime_mean,
+        ymin = score_mean - score_se,
+        ymax = score_mean + score_se
+      ),
+      alpha = 0.20,
+      fill = MODULE_HIGH
+    ) +
+    geom_line(
+      data = dd_bin,
+      aes(pseudotime_mean, score_mean),
+      linewidth = 1.0,
+      color = MODULE_HIGH
+    ) +
+    geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.35, color = "grey40") +
+    theme_trend() +
+    labs(
+      title = mlab,
+      subtitle = paste0(
+        "Spearman rho = ",
+        ifelse(is.finite(rho), round(rho, 3), "NA"),
+        "; FDR = ",
+        ifelse(is.finite(fdr), signif(fdr, 3), "NA")
+      ),
+      x = "Pseudotime 0-1",
+      y = "Module z-score"
+    )
+}
+
+trend_plots <- list()
+
+for (mid in names(module_list)) {
+  p <- plot_one_trend(mid)
+  trend_plots[[mid]] <- p
+
+  save_pdf_png(
+    p,
+    paste0("Trend_", mid),
+    width = 6.4,
+    height = 4.8,
+    outdir = DIR_FIG
+  )
+}
+
+trend_chunks <- split(names(trend_plots), ceiling(seq_along(trend_plots) / 9))
+
+for (i in seq_along(trend_chunks)) {
+  ids <- trend_chunks[[i]]
+
+  fig <- patchwork::wrap_plots(trend_plots[ids], ncol = 3) +
+    patchwork::plot_annotation(
+      title = paste0("Marker module dynamics along strict-QC pseudotime - page ", i),
+      subtitle = "Line shows pseudotime-bin mean; ribbon shows SE",
+      theme = theme(
+        plot.title = element_text(face = "bold", size = 18, color = "black"),
+        plot.subtitle = element_text(size = 11, color = "grey30")
+      )
+    )
+
+  save_pdf_png(
+    fig,
+    paste0("Figure_04_module_pseudotime_trends_page_", sprintf("%02d", i)),
+    width = 18,
+    height = 14,
+    outdir = DIR_COMP
+  )
+}
+
+heat_df <- trend_bin_df %>%
+  mutate(
+    score_clip = pmax(pmin(score_mean, CLIP_MODULE_Z), -CLIP_MODULE_Z),
+    module_label_order = module_label
+  )
+
+module_order <- cor_df %>%
+  arrange(desc(spearman_rho)) %>%
+  pull(module_label)
+
+heat_df$module_label_order <- factor(heat_df$module_label_order, levels = rev(module_order))
+
+p_heat <- ggplot(
+  heat_df,
+  aes(
+    x = pseudotime_bin,
+    y = module_label_order,
+    fill = score_clip
+  )
+) +
+  geom_tile() +
+  scale_fill_gradient2(
+    low = MODULE_LOW,
+    mid = MODULE_MID,
+    high = MODULE_HIGH,
+    midpoint = 0,
+    limits = c(-CLIP_MODULE_Z, CLIP_MODULE_Z),
+    oob = scales::squish,
+    na.value = BACKGROUND_GREY,
+    name = "Mean\nz-score"
+  ) +
+  scale_x_continuous(
+    breaks = seq(0, N_PSEUDOTIME_BINS, by = 10),
+    labels = round(seq(0, 1, length.out = length(seq(0, N_PSEUDOTIME_BINS, by = 10))), 2),
+    expand = c(0, 0)
+  ) +
+  theme_heat(base_size = 10) +
+  labs(
+    title = "Marker module evolution along strict-QC Monocle2 pseudotime",
+    subtitle = "Rows are ordered by Spearman correlation with pseudotime",
+    x = "Pseudotime 0-1",
+    y = NULL
+  )
+
+save_pdf_png(
+  p_heat,
+  "Figure_05_module_pseudotime_bin_heatmap",
+  width = 12,
+  height = max(5.5, 0.35 * length(module_list) + 2),
+  outdir = DIR_HEAT
+)
+
+############################################################
+## 19. State / section 诊断
+############################################################
+
+state_summary <- plot_df %>%
+  group_by(State) %>%
+  summarise(
+    n_spots = n(),
+    mean_pseudotime = mean(Pseudotime_0_1, na.rm = TRUE),
+    median_pseudotime = median(Pseudotime_0_1, na.rm = TRUE),
+    mean_natural_progression = mean(natural_progression_axis, na.rm = TRUE),
+    mean_advanced_axis = mean(advanced_remodeling_axis, na.rm = TRUE),
+    mean_tumor_axis = mean(tumor_epithelial_axis, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(mean_pseudotime)
+
+state_section_summary <- plot_df %>%
+  count(State, sample_short, name = "n_spots") %>%
+  group_by(State) %>%
+  mutate(percent_in_state = n_spots / sum(n_spots) * 100) %>%
+  ungroup()
+
+write.csv(state_summary, file.path(DIR_TAB, "22_state_level_summary.csv"), row.names = FALSE)
+write.csv(state_section_summary, file.path(DIR_TAB, "23_state_section_distribution.csv"), row.names = FALSE)
+
+############################################################
+## 20. 保存
+############################################################
+
+summary_df <- data.frame(
+  item = c(
+    "L_OUTS",
+    "R_OUTS",
+    "marker_file",
+    "output_dir",
+    "n_raw_genes",
+    "n_raw_spots",
+    "n_strict_QC_spots",
+    "n_ordering_genes",
+    "root_state_selected",
+    "pseudotime_direction_method",
+    "tumor_epithelial_override",
+    "tumor_epithelial_literature_genes"
+  ),
+  value = c(
+    L_OUTS,
+    R_OUTS,
+    MARKER_XLSX,
+    OUTDIR,
+    nrow(counts_all),
+    ncol(counts_all),
+    nrow(meta_qc),
+    length(ordering_genes),
+    root_state_selected,
+    unique(plot_df$pseudotime_direction_method)[1],
+    OVERRIDE_TUMOR_EPITHELIAL_WITH_LITERATURE,
+    paste(LITERATURE_TUMOR_EPITHELIAL_GENES, collapse = ";")
+  ),
+  stringsAsFactors = FALSE
+)
+
+write.csv(summary_df, file.path(DIR_TAB, "99_strictQC_Monocle2_summary.csv"), row.names = FALSE)
+
+openxlsx::write.xlsx(
+  list(
+    summary = summary_df,
+    QC_summary = qc_summary,
+    section_qc_summary = section_qc_summary,
+    marker_modules_original = module_meta_original,
+    marker_modules_used = module_meta,
+    module_match_summary = match_summary,
+    module_match_table = match_table,
+    single_gene_match = single_gene_match,
+    ordering_genes = data.frame(ordering_gene = ordering_genes),
+    ordering_gene_candidates = ordering_tbl,
+    state_root_candidates = state_root_summary,
+    state_summary = state_summary,
+    state_section_distribution = state_section_summary,
+    module_pseudotime_correlation = cor_df,
+    module_pseudotime_bin_trend = trend_bin_df,
+    plot_df = plot_df,
+    edge_df = edge_df
+  ),
+  file.path(DIR_XLSX, "NPC_strictQC_Monocle2_new_marker_all_tables.xlsx"),
+  overwrite = TRUE
+)
+
+saveRDS(
+  list(
+    cds = cds,
+    plot_df = plot_df,
+    edge_df = edge_df,
+    counts_traj = counts_traj,
+    meta_raw = meta,
+    meta_qc = meta_qc,
+    log_expr_qc = log_expr_qc,
+    module_list = module_list,
+    module_meta = module_meta,
+    module_meta_original = module_meta_original,
+    score_res = score_res,
+    match_table = match_table,
+    match_summary = match_summary,
+    ordering_genes = ordering_genes,
+    ordering_tbl = ordering_tbl,
+    state_root_summary = state_root_summary,
+    state_summary = state_summary,
+    state_section_summary = state_section_summary,
+    trend_bin_df = trend_bin_df,
+    cor_df = cor_df,
+    summary = summary_df
+  ),
+  file.path(DIR_RDS, "01_NPC_strictQC_Monocle2_new_marker_result.rds")
+)
+
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(OUTDIR, "sessionInfo_strictQC_Monocle2_new_marker.txt")
+)
+
+message("============================================================")
+message("完成：严格 QC + 新 marker + 重新构建 Monocle2")
+message("输出目录：", OUTDIR)
+message("主图：", file.path(DIR_COMP, "Figure_01_strictQC_Monocle2_main_board.png"))
+message("模块热图：", file.path(DIR_HEAT, "Figure_05_module_pseudotime_bin_heatmap.png"))
+message("Excel汇总：", file.path(DIR_XLSX, "NPC_strictQC_Monocle2_new_marker_all_tables.xlsx"))
+message("RDS：", file.path(DIR_RDS, "01_NPC_strictQC_Monocle2_new_marker_result.rds"))
+message("============================================================")

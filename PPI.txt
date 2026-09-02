@@ -1,0 +1,1525 @@
+############################################################
+## 鼻咽癌 T分期交集基因 PPI 分析
+##
+## 输入：
+## /media/desk16/iy2142/鼻咽癌课题/T分期交集/03_T分期内部韦恩图/
+##   01_common_genes_all_6_Tstage_comparisons_p005.csv
+##
+## 输出：
+## /media/desk16/iy2142/鼻咽癌课题/T分期交集/04_PPI
+##
+## 结果：
+## 1. 原始 PPI 网络
+## 2. 关键基因标红版 PPI 网络
+## 3. 节点大小 = weighted degree
+## 4. 边粗细 = STRING combined_score
+## 5. 关键基因量化表
+## 6. Cytoscape 可导入文件
+############################################################
+
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+
+## STRINGdb 第一次运行需要下载 9606.protein.links 文件，默认 60 秒容易超时
+options(timeout = max(1200, getOption("timeout")))
+
+## Linux / RStudio Server 推荐使用 libcurl
+if (capabilities("libcurl")) {
+  options(download.file.method = "libcurl")
+}
+set.seed(123)
+
+############################################################
+## 0. 路径
+############################################################
+
+IN_COMMON_GENE <- "/media/desk16/iy2142/鼻咽癌课题/T分期交集/03_T分期内部韦恩图/01_common_genes_all_6_Tstage_comparisons_p005.csv"
+
+OUTDIR <- "/media/desk16/iy2142/鼻咽癌课题/T分期交集/04_PPI"
+
+DIR_TAB <- file.path(OUTDIR, "01_tables")
+DIR_NET <- file.path(OUTDIR, "02_network_files")
+DIR_FIG <- file.path(OUTDIR, "03_figures")
+DIR_KEY <- file.path(OUTDIR, "04_key_gene_results")
+DIR_XLSX <- file.path(OUTDIR, "05_excel")
+DIR_RDS <- file.path(OUTDIR, "00_Robject")
+DIR_CACHE <- file.path(OUTDIR, "STRINGdb_cache")
+
+dir.create(OUTDIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_TAB, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_NET, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_FIG, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_KEY, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_XLSX, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_RDS, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_CACHE, recursive = TRUE, showWarnings = FALSE)
+
+if (!file.exists(IN_COMMON_GENE)) {
+  stop("找不到交集基因文件：", IN_COMMON_GENE)
+}
+
+############################################################
+## 1. 参数
+############################################################
+
+## STRING 人类物种编号
+STRING_SPECIES <- 9606
+
+## 中等置信度 PPI 阈值
+STRING_SCORE_CUTOFF <- 400
+
+## STRINGdb 版本自动尝试
+STRING_VERSION_CANDIDATES <- c("12.0", "11.5", "11.0", "10")
+
+## 图中显示的 hub 标签数量
+TOP_HUB_LABEL_N_RAW <- 20
+TOP_HUB_LABEL_N_KEY <- 15
+
+## barplot 展示数量
+TOP_HUB_BAR_N <- 30
+
+## 是否清理旧输出
+CLEAR_OLD_OUTPUT <- TRUE
+
+############################################################
+## 2. 清理旧输出
+############################################################
+
+if (CLEAR_OLD_OUTPUT) {
+  old_files <- list.files(
+    OUTDIR,
+    pattern = "\\.(csv|xlsx|rds|txt|pdf|png|sif)$",
+    recursive = TRUE,
+    full.names = TRUE
+  )
+  
+  if (length(old_files) > 0) {
+    unlink(old_files)
+    message("已删除旧输出文件数量：", length(old_files))
+  }
+}
+
+dir.create(DIR_TAB, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_NET, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_FIG, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_KEY, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_XLSX, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_RDS, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_CACHE, recursive = TRUE, showWarnings = FALSE)
+
+############################################################
+## 3. 加载包
+############################################################
+
+need_pkgs <- c(
+  "STRINGdb",
+  "dplyr",
+  "tidyr",
+  "igraph",
+  "ggplot2",
+  "ggrepel",
+  "openxlsx",
+  "scales"
+)
+
+for (p in need_pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    if (p == "STRINGdb") {
+      stop("缺少 R 包：STRINGdb。请先运行：BiocManager::install('STRINGdb')")
+    } else {
+      stop("缺少 R 包：", p, "。请先安装。")
+    }
+  }
+}
+
+suppressPackageStartupMessages({
+  library(STRINGdb)
+  library(dplyr)
+  library(tidyr)
+  library(igraph)
+  library(ggplot2)
+  library(ggrepel)
+  library(openxlsx)
+  library(scales)
+})
+
+############################################################
+## 4. 工具函数
+############################################################
+
+clean_gene_key <- function(x) {
+  x <- toupper(as.character(x))
+  x <- trimws(x)
+  x <- gsub("\\s+", "", x)
+  x <- gsub("[^A-Z0-9\\-]", "", x)
+  x
+}
+
+safe_sheet <- function(x) {
+  x <- gsub("[\\[\\]\\*\\?/\\\\:]", "_", x)
+  x <- substr(x, 1, 31)
+  ifelse(x == "", "sheet", x)
+}
+
+safe_rescale <- function(x, to = c(1, 8)) {
+  x <- as.numeric(x)
+  out <- rep(mean(to), length(x))
+  ok <- is.finite(x)
+  
+  if (sum(ok) == 0) return(out)
+  
+  if (length(unique(x[ok])) == 1) {
+    out[ok] <- mean(to)
+  } else {
+    out[ok] <- scales::rescale(x[ok], to = to)
+  }
+  
+  out
+}
+
+save_pdf_png <- function(p, prefix, outdir, width = 10, height = 8, dpi = 320) {
+  dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+  
+  pdf_file <- file.path(outdir, paste0(prefix, ".pdf"))
+  png_file <- file.path(outdir, paste0(prefix, ".png"))
+  
+  ggplot2::ggsave(
+    filename = pdf_file,
+    plot = p,
+    width = width,
+    height = height,
+    bg = "white",
+    limitsize = FALSE
+  )
+  
+  ggplot2::ggsave(
+    filename = png_file,
+    plot = p,
+    width = width,
+    height = height,
+    dpi = dpi,
+    bg = "white",
+    limitsize = FALSE
+  )
+  
+  message("[PDF] ", pdf_file)
+  message("[PNG] ", png_file)
+  
+  invisible(list(pdf = pdf_file, png = png_file))
+}
+
+init_STRINGdb <- function() {
+  last_error <- NULL
+  
+  for (v in STRING_VERSION_CANDIDATES) {
+    message("尝试初始化 STRINGdb version = ", v)
+    
+    obj <- tryCatch(
+      {
+        STRINGdb::STRINGdb$new(
+          version = v,
+          species = STRING_SPECIES,
+          score_threshold = 0,
+          input_directory = DIR_CACHE
+        )
+      },
+      error = function(e) {
+        last_error <<- e$message
+        NULL
+      }
+    )
+    
+    if (!is.null(obj)) {
+      message("STRINGdb 初始化成功，version = ", v)
+      return(list(db = obj, version = v))
+    }
+  }
+  
+  stop(
+    "STRINGdb 初始化失败。最后错误信息：",
+    last_error,
+    "\n请检查网络连接或 STRINGdb 安装。"
+  )
+}
+
+find_score_col <- function(df) {
+  cand <- c(
+    "combined_score",
+    "score",
+    "combined.score",
+    "combinedscore"
+  )
+  
+  hit <- cand[cand %in% colnames(df)]
+  
+  if (length(hit) > 0) {
+    return(hit[1])
+  }
+  
+  stop("STRING 互作结果中找不到 combined_score / score 列。")
+}
+
+make_empty_plot <- function(title_text, subtitle_text = "") {
+  ggplot() +
+    annotate(
+      "text",
+      x = 0,
+      y = 0,
+      label = title_text,
+      size = 5,
+      fontface = "bold"
+    ) +
+    annotate(
+      "text",
+      x = 0,
+      y = -0.2,
+      label = subtitle_text,
+      size = 3.5
+    ) +
+    theme_void()
+}
+
+############################################################
+## 5. 读取交集基因
+############################################################
+
+common_df <- read.csv(
+  IN_COMMON_GENE,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+if (!"gene" %in% colnames(common_df)) {
+  colnames(common_df)[1] <- "gene"
+}
+
+common_genes <- common_df$gene
+common_genes <- clean_gene_key(common_genes)
+common_genes <- common_genes[!is.na(common_genes) & common_genes != ""]
+common_genes <- sort(unique(common_genes))
+
+if (length(common_genes) == 0) {
+  stop("交集基因为空：", IN_COMMON_GENE)
+}
+
+input_gene_df <- data.frame(
+  gene = common_genes,
+  stringsAsFactors = FALSE
+)
+
+write.csv(
+  input_gene_df,
+  file.path(DIR_TAB, "01_input_common_genes_for_PPI.csv"),
+  row.names = FALSE
+)
+
+message("输入交集基因数量：", length(common_genes))
+
+############################################################
+## 6. 关键基因列表清洗、去重和别名扩展
+############################################################
+
+KEY_GENE_TEXT <- "
+SPARC, COL1A1, COL1A2, COL3A1, COL4A1, COL4A2, COL5A1, COL5A2,
+COL6A1, COL6A2, COL6A3, COL8A1, COL11A1, COL11A2, COL12A1,
+COL14A1, COL15A1, COL16A1, COL17A1, COL18A1, COL21A1,
+LAMA1, LAMA2, LAMA3, LAMB1, LAMB2, LAMB3, LAMC1, LAMC2, LAMC3,
+FN1, TNC, THBS1, THBS2, VTN, MMP1, MMP2, MMP3, MMP9, MMP10, MMP11,
+IL6, IL8, IL1B, MMP1, MMP3, CCL2, CXCL1, CXCL5, FGF2, FGF7,
+MIC1, PMAP1, CCL5, CX3CL1, HGF, STF2, MMP2, MMP9, SERPINE1,
+ANAPC11, CDK2, CDK4, NFRKB1, RELA, RPS6KA2, UBA52, UBE2I, UBE2E1,
+COL3A1、COL4A5、COL5A1、COL6A1、COL6A2、MMP1、MMP2、MMP12、
+CXCL1、CXCL3、CXCL8、CXCL10、CXCL16
+"
+
+key_direct <- unlist(strsplit(KEY_GENE_TEXT, "[,，、;；\\s]+"))
+key_direct <- clean_gene_key(key_direct)
+key_direct <- key_direct[!is.na(key_direct) & key_direct != ""]
+key_direct_unique <- sort(unique(key_direct))
+
+key_direct_df <- data.frame(
+  key_gene_input = key_direct_unique,
+  gene_for_matching = key_direct_unique,
+  match_type = "direct",
+  alias_note = NA_character_,
+  stringsAsFactors = FALSE
+)
+
+## 少量常见别名扩展：
+## IL8 对应 CXCL8；MIC1 常用基因符号 GDF15；NFRKB1 可能对应用户想写的 NFKB1。
+## PMAP1 / STF2 不做静默替换，只保留原输入。
+key_alias_df <- data.frame(
+  key_gene_input = c("IL8", "MIC1", "NFRKB1"),
+  gene_for_matching = c("CXCL8", "GDF15", "NFKB1"),
+  match_type = "alias_candidate",
+  alias_note = c(
+    "IL8 is commonly represented as CXCL8",
+    "MIC1 is commonly represented as GDF15",
+    "NFRKB1 may be intended as NFKB1; kept as alias candidate"
+  ),
+  stringsAsFactors = FALSE
+)
+
+key_match_df <- dplyr::bind_rows(
+  key_direct_df,
+  key_alias_df
+) %>%
+  dplyr::mutate(
+    key_gene_input = clean_gene_key(key_gene_input),
+    gene_for_matching = clean_gene_key(gene_for_matching)
+  ) %>%
+  dplyr::filter(
+    !is.na(key_gene_input),
+    key_gene_input != "",
+    !is.na(gene_for_matching),
+    gene_for_matching != ""
+  ) %>%
+  dplyr::distinct(
+    key_gene_input,
+    gene_for_matching,
+    match_type,
+    .keep_all = TRUE
+  )
+
+write.csv(
+  key_direct_df,
+  file.path(DIR_KEY, "01_key_genes_input_cleaned_deduplicated.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  key_match_df,
+  file.path(DIR_KEY, "02_key_genes_for_matching_with_alias_candidates.csv"),
+  row.names = FALSE
+)
+
+message("关键基因去重后数量：", length(key_direct_unique))
+message("关键基因匹配候选数量：", nrow(key_match_df))
+
+############################################################
+## 7. STRINGdb 映射
+############################################################
+
+message("========== STRINGdb 映射 ==========")
+
+string_obj <- init_STRINGdb()
+string_db <- string_obj$db
+STRING_VERSION_USED <- string_obj$version
+
+mapped <- string_db$map(
+  input_gene_df,
+  "gene",
+  removeUnmappedRows = FALSE
+)
+
+if (!"STRING_id" %in% colnames(mapped)) {
+  stop("STRINGdb map 结果缺少 STRING_id 列。")
+}
+
+if (!"preferred_name" %in% colnames(mapped)) {
+  mapped$preferred_name <- mapped$gene
+}
+
+mapped <- mapped %>%
+  dplyr::mutate(
+    gene = clean_gene_key(gene),
+    preferred_name = clean_gene_key(preferred_name),
+    mapped_to_STRING = !is.na(STRING_id) & STRING_id != ""
+  )
+
+mapped_ok <- mapped %>%
+  dplyr::filter(mapped_to_STRING)
+
+unmapped <- mapped %>%
+  dplyr::filter(!mapped_to_STRING)
+
+write.csv(
+  mapped,
+  file.path(DIR_TAB, "02_STRING_mapped_genes_all.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  mapped_ok,
+  file.path(DIR_TAB, "03_STRING_mapped_genes_success.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  unmapped,
+  file.path(DIR_TAB, "04_STRING_unmapped_genes.csv"),
+  row.names = FALSE
+)
+
+message("STRING 成功映射基因数量：", nrow(mapped_ok))
+message("STRING 未映射基因数量：", nrow(unmapped))
+
+if (nrow(mapped_ok) < 2) {
+  stop("成功映射到 STRING 的基因少于 2 个，无法构建 PPI。")
+}
+
+id_map <- mapped_ok %>%
+  dplyr::group_by(STRING_id) %>%
+  dplyr::summarise(
+    gene_symbol = dplyr::first(preferred_name),
+    input_gene_symbols = paste(sort(unique(gene)), collapse = ";"),
+    input_gene_clean_all = paste(sort(unique(clean_gene_key(gene))), collapse = ";"),
+    n_input_genes_mapped_to_this_STRING_id = dplyr::n_distinct(gene),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    gene_symbol = ifelse(
+      is.na(gene_symbol) | gene_symbol == "",
+      sapply(strsplit(input_gene_symbols, ";"), `[`, 1),
+      gene_symbol
+    ),
+    gene_clean = clean_gene_key(gene_symbol)
+  )
+
+write.csv(
+  id_map,
+  file.path(DIR_TAB, "05_STRING_id_to_gene_symbol_map.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## 8. 获取 STRING PPI 边
+############################################################
+
+message("========== 获取 STRING PPI 互作 ==========")
+
+string_ids <- unique(mapped_ok$STRING_id)
+
+## 第一次下载失败后，可能会残留不完整文件；这里先清理可疑的临时/残缺文件
+clean_incomplete_string_cache <- function(cache_dir) {
+  if (!dir.exists(cache_dir)) return(invisible(NULL))
+  
+  candidate_files <- list.files(
+    cache_dir,
+    pattern = "protein\\.links|\\.tmp|tmp",
+    recursive = TRUE,
+    full.names = TRUE,
+    ignore.case = TRUE
+  )
+  
+  if (length(candidate_files) == 0) return(invisible(NULL))
+  
+  info <- file.info(candidate_files)
+  bad_files <- rownames(info)[
+    !is.na(info$size) &
+      info$size > 0 &
+      info$size < 80000000
+  ]
+  
+  if (length(bad_files) > 0) {
+    message("删除可能未下载完整的 STRING 缓存文件数量：", length(bad_files))
+    unlink(bad_files, force = TRUE)
+  }
+  
+  invisible(NULL)
+}
+
+get_string_interactions_retry <- function(string_db, string_ids, max_try = 5) {
+  last_error <- NULL
+  
+  for (ii in seq_len(max_try)) {
+    message("STRING get_interactions 尝试第 ", ii, " / ", max_try, " 次")
+    
+    ppi_try <- tryCatch(
+      {
+        string_db$get_interactions(string_ids)
+      },
+      error = function(e) {
+        last_error <<- e$message
+        NULL
+      }
+    )
+    
+    if (!is.null(ppi_try) && is.data.frame(ppi_try) && nrow(ppi_try) > 0) {
+      message("STRING get_interactions 成功。")
+      return(ppi_try)
+    }
+    
+    message("本次 STRING get_interactions 失败。")
+    
+    if (!is.null(last_error)) {
+      message("错误信息：", last_error)
+    }
+    
+    clean_incomplete_string_cache(DIR_CACHE)
+    
+    wait_sec <- min(60, ii * 15)
+    message("等待 ", wait_sec, " 秒后重试。")
+    Sys.sleep(wait_sec)
+  }
+  
+  stop(
+    "STRINGdb get_interactions 连续失败。最后错误信息：",
+    last_error,
+    "\n建议检查服务器网络，或手动下载 STRING protein.links 文件。"
+  )
+}
+
+clean_incomplete_string_cache(DIR_CACHE)
+
+ppi_raw <- get_string_interactions_retry(
+  string_db = string_db,
+  string_ids = string_ids,
+  max_try = 5
+)
+
+if (nrow(ppi_raw) == 0) {
+  stop("STRINGdb 未返回任何互作边。")
+}
+
+score_col <- find_score_col(ppi_raw)
+
+ppi_raw2 <- ppi_raw %>%
+  dplyr::mutate(
+    combined_score_raw = as.numeric(.data[[score_col]]),
+    combined_score = combined_score_raw
+  )
+
+## 有些接口可能返回 0-1 的分数，这里统一转换到 0-1000
+if (max(ppi_raw2$combined_score, na.rm = TRUE) <= 1) {
+  ppi_raw2 <- ppi_raw2 %>%
+    dplyr::mutate(
+      combined_score = combined_score * 1000
+    )
+}
+
+ppi_raw2 <- ppi_raw2 %>%
+  dplyr::filter(
+    from %in% id_map$STRING_id,
+    to %in% id_map$STRING_id,
+    from != to,
+    is.finite(combined_score)
+  ) %>%
+  dplyr::mutate(
+    edge_key = ifelse(
+      from < to,
+      paste(from, to, sep = "__"),
+      paste(to, from, sep = "__")
+    )
+  ) %>%
+  dplyr::arrange(dplyr::desc(combined_score)) %>%
+  dplyr::distinct(edge_key, .keep_all = TRUE)
+
+write.csv(
+  ppi_raw2,
+  file.path(DIR_TAB, "06_PPI_edges_raw_all_STRING_mapped_pairs.csv"),
+  row.names = FALSE
+)
+
+ppi_edges <- ppi_raw2 %>%
+  dplyr::filter(combined_score >= STRING_SCORE_CUTOFF) %>%
+  dplyr::left_join(
+    id_map %>%
+      dplyr::select(
+        from = STRING_id,
+        from_gene = gene_symbol,
+        from_input_genes = input_gene_symbols
+      ),
+    by = "from"
+  ) %>%
+  dplyr::left_join(
+    id_map %>%
+      dplyr::select(
+        to = STRING_id,
+        to_gene = gene_symbol,
+        to_input_genes = input_gene_symbols
+      ),
+    by = "to"
+  ) %>%
+  dplyr::mutate(
+    combined_score_0_1 = combined_score / 1000
+  ) %>%
+  dplyr::select(
+    from,
+    to,
+    from_gene,
+    to_gene,
+    from_input_genes,
+    to_input_genes,
+    combined_score,
+    combined_score_0_1,
+    dplyr::everything()
+  )
+
+if (nrow(ppi_edges) == 0) {
+  stop(
+    "combined_score >= ",
+    STRING_SCORE_CUTOFF,
+    " 后没有 PPI 边。可以降低 STRING_SCORE_CUTOFF，例如 150 或 200。"
+  )
+}
+
+write.csv(
+  ppi_edges,
+  file.path(DIR_TAB, paste0("07_PPI_edges_STRING_score_ge", STRING_SCORE_CUTOFF, ".csv")),
+  row.names = FALSE
+)
+
+message("PPI 原始边数量：", nrow(ppi_raw2))
+message("PPI 过滤后边数量 combined_score >= ", STRING_SCORE_CUTOFF, "：", nrow(ppi_edges))
+############################################################
+## 9. 构建网络并计算节点指标
+############################################################
+
+message("========== 构建 igraph 网络 ==========")
+
+network_ids <- sort(unique(c(ppi_edges$from, ppi_edges$to)))
+
+nodes_base <- id_map %>%
+  dplyr::filter(STRING_id %in% network_ids) %>%
+  dplyr::mutate(
+    name = STRING_id
+  )
+
+edges_for_graph <- ppi_edges %>%
+  dplyr::select(
+    from,
+    to,
+    combined_score,
+    combined_score_0_1,
+    from_gene,
+    to_gene
+  )
+
+g <- igraph::graph_from_data_frame(
+  d = edges_for_graph,
+  directed = FALSE,
+  vertices = nodes_base
+)
+
+E(g)$weight_score <- E(g)$combined_score_0_1
+E(g)$distance_weight <- 1 / (E(g)$weight_score + 1e-6)
+
+comp <- igraph::components(g)
+
+V(g)$degree <- igraph::degree(g)
+V(g)$weighted_degree <- igraph::strength(g, weights = E(g)$weight_score)
+V(g)$betweenness <- igraph::betweenness(
+  g,
+  weights = E(g)$distance_weight,
+  normalized = TRUE
+)
+V(g)$closeness <- suppressWarnings(
+  igraph::closeness(
+    g,
+    weights = E(g)$distance_weight,
+    normalized = TRUE
+  )
+)
+V(g)$component_id <- comp$membership
+V(g)$component_size <- comp$csize[comp$membership]
+V(g)$in_largest_component <- V(g)$component_id == which.max(comp$csize)
+
+nodes_metrics <- igraph::as_data_frame(g, what = "vertices") %>%
+  dplyr::rename(STRING_id = name) %>%
+  dplyr::mutate(
+    degree_rank = rank(-degree, ties.method = "min"),
+    weighted_degree_rank = rank(-weighted_degree, ties.method = "min"),
+    betweenness_rank = rank(-betweenness, ties.method = "min"),
+    gene_clean = clean_gene_key(gene_symbol)
+  ) %>%
+  dplyr::arrange(weighted_degree_rank, degree_rank, gene_symbol)
+
+############################################################
+## 10. 标记关键基因
+############################################################
+
+key_match_vector <- unique(key_match_df$gene_for_matching)
+
+get_key_hits <- function(gene_clean, input_gene_clean_all) {
+  candidate <- unique(c(
+    clean_gene_key(gene_clean),
+    unlist(strsplit(as.character(input_gene_clean_all), ";", fixed = TRUE))
+  ))
+  
+  candidate <- candidate[!is.na(candidate) & candidate != ""]
+  
+  hit <- key_match_df %>%
+    dplyr::filter(gene_for_matching %in% candidate)
+  
+  if (nrow(hit) == 0) {
+    return("")
+  }
+  
+  paste(
+    sort(unique(hit$key_gene_input)),
+    collapse = ";"
+  )
+}
+
+get_key_match_symbols <- function(gene_clean, input_gene_clean_all) {
+  candidate <- unique(c(
+    clean_gene_key(gene_clean),
+    unlist(strsplit(as.character(input_gene_clean_all), ";", fixed = TRUE))
+  ))
+  
+  candidate <- candidate[!is.na(candidate) & candidate != ""]
+  
+  hit <- key_match_df %>%
+    dplyr::filter(gene_for_matching %in% candidate)
+  
+  if (nrow(hit) == 0) {
+    return("")
+  }
+  
+  paste(
+    sort(unique(hit$gene_for_matching)),
+    collapse = ";"
+  )
+}
+
+nodes_metrics <- nodes_metrics %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(
+    key_gene_input_matched = get_key_hits(gene_clean, input_gene_clean_all),
+    key_gene_symbol_matched = get_key_match_symbols(gene_clean, input_gene_clean_all),
+    is_key_gene = key_gene_input_matched != ""
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    node_class = ifelse(is_key_gene, "Key gene", "Other")
+  )
+
+write.csv(
+  nodes_metrics,
+  file.path(DIR_TAB, "08_PPI_nodes_with_network_metrics_and_key_flag.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## 10.1 关键基因 present / mapped / in_network 汇总
+## 修复 mutate 长度不一致问题
+############################################################
+
+match_gene_in_semicolon_vector <- function(gene, vec) {
+  gene <- clean_gene_key(gene)
+  vec <- as.character(vec)
+  vec <- vec[!is.na(vec) & vec != ""]
+  
+  if (length(vec) == 0 || is.na(gene) || gene == "") {
+    return(FALSE)
+  }
+  
+  any(
+    vapply(
+      strsplit(vec, ";", fixed = TRUE),
+      function(x) {
+        gene %in% clean_gene_key(x)
+      },
+      logical(1)
+    )
+  )
+}
+
+key_gene_summary <- key_match_df %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(
+    present_in_intersection = gene_for_matching %in% common_genes,
+    
+    mapped_to_STRING = gene_for_matching %in% clean_gene_key(mapped_ok$gene) |
+      gene_for_matching %in% clean_gene_key(mapped_ok$preferred_name),
+    
+    in_PPI_network = gene_for_matching %in% clean_gene_key(nodes_metrics$gene_clean) |
+      match_gene_in_semicolon_vector(
+        gene = gene_for_matching,
+        vec = nodes_metrics$input_gene_clean_all
+      ) |
+      match_gene_in_semicolon_vector(
+        gene = gene_for_matching,
+        vec = nodes_metrics$key_gene_symbol_matched
+      ) |
+      match_gene_in_semicolon_vector(
+        gene = gene_for_matching,
+        vec = nodes_metrics$key_gene_input_matched
+      )
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(
+    dplyr::desc(in_PPI_network),
+    dplyr::desc(mapped_to_STRING),
+    dplyr::desc(present_in_intersection),
+    key_gene_input,
+    gene_for_matching
+  )
+
+write.csv(
+  key_gene_summary,
+  file.path(DIR_KEY, "03_key_genes_present_missing_STRING_network_summary.csv"),
+  row.names = FALSE
+)
+
+key_nodes_metrics <- nodes_metrics %>%
+  dplyr::filter(is_key_gene) %>%
+  dplyr::arrange(weighted_degree_rank, degree_rank)
+
+write.csv(
+  key_nodes_metrics,
+  file.path(DIR_KEY, "04_key_genes_in_PPI_network_metrics.csv"),
+  row.names = FALSE
+)
+
+message("进入 PPI 网络的关键节点数量：", nrow(key_nodes_metrics))
+write.csv(
+  key_gene_summary,
+  file.path(DIR_KEY, "03_key_genes_present_missing_STRING_network_summary.csv"),
+  row.names = FALSE
+)
+
+key_nodes_metrics <- nodes_metrics %>%
+  dplyr::filter(is_key_gene) %>%
+  dplyr::arrange(weighted_degree_rank, degree_rank)
+
+write.csv(
+  key_nodes_metrics,
+  file.path(DIR_KEY, "04_key_genes_in_PPI_network_metrics.csv"),
+  row.names = FALSE
+)
+
+message("进入 PPI 网络的关键节点数量：", nrow(key_nodes_metrics))
+
+############################################################
+## 11. 更新边表，加入节点关键基因信息
+############################################################
+
+ppi_edges_final <- ppi_edges %>%
+  dplyr::left_join(
+    nodes_metrics %>%
+      dplyr::select(
+        from = STRING_id,
+        from_is_key_gene = is_key_gene,
+        from_degree = degree,
+        from_weighted_degree = weighted_degree
+      ),
+    by = "from"
+  ) %>%
+  dplyr::left_join(
+    nodes_metrics %>%
+      dplyr::select(
+        to = STRING_id,
+        to_is_key_gene = is_key_gene,
+        to_degree = degree,
+        to_weighted_degree = weighted_degree
+      ),
+    by = "to"
+  ) %>%
+  dplyr::mutate(
+    edge_has_key_gene = from_is_key_gene | to_is_key_gene
+  )
+
+write.csv(
+  ppi_edges_final,
+  file.path(DIR_TAB, paste0("09_PPI_edges_final_STRING_score_ge", STRING_SCORE_CUTOFF, "_with_key_flag.csv")),
+  row.names = FALSE
+)
+
+############################################################
+## 12. Cytoscape 文件
+############################################################
+
+cyto_nodes <- nodes_metrics %>%
+  dplyr::transmute(
+    id = gene_symbol,
+    STRING_id = STRING_id,
+    input_gene_symbols = input_gene_symbols,
+    is_key_gene = is_key_gene,
+    key_gene_input_matched = key_gene_input_matched,
+    degree = degree,
+    weighted_degree = weighted_degree,
+    betweenness = betweenness,
+    closeness = closeness,
+    component_id = component_id,
+    component_size = component_size,
+    in_largest_component = in_largest_component
+  )
+
+cyto_edges <- ppi_edges_final %>%
+  dplyr::transmute(
+    source = from_gene,
+    target = to_gene,
+    interaction = "STRING_PPI",
+    combined_score = combined_score,
+    combined_score_0_1 = combined_score_0_1,
+    edge_has_key_gene = edge_has_key_gene
+  )
+
+sif_df <- cyto_edges %>%
+  dplyr::transmute(
+    source,
+    interaction,
+    target
+  )
+
+write.csv(
+  cyto_nodes,
+  file.path(DIR_NET, "PPI_nodes_for_Cytoscape.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  cyto_edges,
+  file.path(DIR_NET, "PPI_edges_for_Cytoscape.csv"),
+  row.names = FALSE
+)
+
+write.table(
+  sif_df,
+  file.path(DIR_NET, "PPI_network.sif"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE
+)
+
+############################################################
+## 13. 网络布局和绘图数据
+############################################################
+
+message("========== 计算网络布局 ==========")
+
+set.seed(123)
+layout_mat <- igraph::layout_with_fr(
+  g,
+  weights = E(g)$weight_score,
+  niter = 1500
+)
+
+layout_df <- data.frame(
+  STRING_id = V(g)$name,
+  x = layout_mat[, 1],
+  y = layout_mat[, 2],
+  stringsAsFactors = FALSE
+)
+
+nodes_plot <- nodes_metrics %>%
+  dplyr::left_join(layout_df, by = "STRING_id") %>%
+  dplyr::mutate(
+    node_size_plot = safe_rescale(weighted_degree, to = c(1.2, 8.5)),
+    node_fill = ifelse(is_key_gene, "Key gene", "Other"),
+    label_raw = ifelse(weighted_degree_rank <= TOP_HUB_LABEL_N_RAW, gene_symbol, ""),
+    label_key = ifelse(
+      is_key_gene | weighted_degree_rank <= TOP_HUB_LABEL_N_KEY,
+      gene_symbol,
+      ""
+    )
+  )
+
+edges_plot <- ppi_edges_final %>%
+  dplyr::left_join(
+    nodes_plot %>%
+      dplyr::select(from = STRING_id, x_from = x, y_from = y),
+    by = "from"
+  ) %>%
+  dplyr::left_join(
+    nodes_plot %>%
+      dplyr::select(to = STRING_id, x_to = x, y_to = y),
+    by = "to"
+  ) %>%
+  dplyr::mutate(
+    edge_width_plot = safe_rescale(combined_score, to = c(0.15, 1.6)),
+    edge_alpha_plot = safe_rescale(combined_score, to = c(0.06, 0.35))
+  ) %>%
+  dplyr::filter(
+    is.finite(x_from),
+    is.finite(y_from),
+    is.finite(x_to),
+    is.finite(y_to)
+  )
+
+write.csv(
+  nodes_plot,
+  file.path(DIR_TAB, "10_PPI_nodes_plot_coordinates.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  edges_plot,
+  file.path(DIR_TAB, "11_PPI_edges_plot_coordinates.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## 14. 原始 PPI 网络图
+############################################################
+
+message("========== 绘制原始 PPI 网络图 ==========")
+
+label_raw_df <- nodes_plot %>%
+  dplyr::filter(weighted_degree_rank <= TOP_HUB_LABEL_N_RAW)
+
+p_raw <- ggplot() +
+  geom_segment(
+    data = edges_plot,
+    aes(
+      x = x_from,
+      y = y_from,
+      xend = x_to,
+      yend = y_to,
+      linewidth = edge_width_plot,
+      alpha = edge_alpha_plot
+    ),
+    color = "grey55"
+  ) +
+  scale_linewidth_identity() +
+  scale_alpha_identity() +
+  geom_point(
+    data = nodes_plot,
+    aes(
+      x = x,
+      y = y,
+      size = weighted_degree
+    ),
+    shape = 21,
+    fill = "grey70",
+    color = "grey25",
+    stroke = 0.18,
+    alpha = 0.90
+  ) +
+  scale_size_continuous(
+    range = c(1.2, 8.5),
+    name = "Weighted degree"
+  ) +
+  ggrepel::geom_text_repel(
+    data = label_raw_df,
+    aes(
+      x = x,
+      y = y,
+      label = gene_symbol
+    ),
+    size = 3.0,
+    color = "black",
+    max.overlaps = Inf,
+    box.padding = 0.35,
+    point.padding = 0.25,
+    segment.color = "grey55",
+    segment.linewidth = 0.25
+  ) +
+  theme_void(base_size = 12) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 16,
+      color = "black"
+    ),
+    plot.subtitle = element_text(
+      hjust = 0.5,
+      size = 10,
+      color = "grey30"
+    )
+  ) +
+  labs(
+    title = "Raw PPI network of T-stage common genes",
+    subtitle = paste0(
+      "STRING v", STRING_VERSION_USED,
+      " | species = human | combined_score >= ",
+      STRING_SCORE_CUTOFF,
+      " | nodes = ", nrow(nodes_plot),
+      " | edges = ", nrow(edges_plot),
+      "\nNode size = weighted degree; edge width = STRING combined score"
+    )
+  )
+
+save_pdf_png(
+  p_raw,
+  prefix = paste0("Figure_01_raw_PPI_network_STRING_score_ge", STRING_SCORE_CUTOFF),
+  outdir = DIR_FIG,
+  width = 12,
+  height = 10,
+  dpi = 360
+)
+
+############################################################
+## 15. 关键基因标红 PPI 网络图
+############################################################
+
+message("========== 绘制关键基因标红 PPI 网络图 ==========")
+
+label_key_df <- nodes_plot %>%
+  dplyr::filter(
+    is_key_gene | weighted_degree_rank <= TOP_HUB_LABEL_N_KEY
+  )
+
+p_key <- ggplot() +
+  geom_segment(
+    data = edges_plot,
+    aes(
+      x = x_from,
+      y = y_from,
+      xend = x_to,
+      yend = y_to,
+      linewidth = edge_width_plot,
+      alpha = edge_alpha_plot
+    ),
+    color = "grey55"
+  ) +
+  scale_linewidth_identity() +
+  scale_alpha_identity() +
+  geom_point(
+    data = nodes_plot,
+    aes(
+      x = x,
+      y = y,
+      size = weighted_degree,
+      fill = node_fill
+    ),
+    shape = 21,
+    color = "grey20",
+    stroke = 0.22,
+    alpha = 0.95
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Key gene" = "#D73027",
+      "Other" = "grey78"
+    ),
+    name = ""
+  ) +
+  scale_size_continuous(
+    range = c(1.2, 9.0),
+    name = "Weighted degree"
+  ) +
+  ggrepel::geom_text_repel(
+    data = label_key_df,
+    aes(
+      x = x,
+      y = y,
+      label = gene_symbol,
+      color = node_fill
+    ),
+    size = 3.0,
+    max.overlaps = Inf,
+    box.padding = 0.35,
+    point.padding = 0.25,
+    segment.color = "grey55",
+    segment.linewidth = 0.25,
+    show.legend = FALSE
+  ) +
+  scale_color_manual(
+    values = c(
+      "Key gene" = "#B2182B",
+      "Other" = "black"
+    )
+  ) +
+  theme_void(base_size = 12) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 16,
+      color = "black"
+    ),
+    plot.subtitle = element_text(
+      hjust = 0.5,
+      size = 10,
+      color = "grey30"
+    )
+  ) +
+  labs(
+    title = "Key gene highlighted PPI network",
+    subtitle = paste0(
+      "Red nodes = predefined key genes present in PPI network",
+      " | Node size = weighted degree",
+      " | Edge width = STRING combined score",
+      "\nKey nodes in network = ", nrow(key_nodes_metrics),
+      " | total nodes = ", nrow(nodes_plot),
+      " | total edges = ", nrow(edges_plot)
+    )
+  )
+
+save_pdf_png(
+  p_key,
+  prefix = paste0("Figure_02_key_gene_highlighted_PPI_network_STRING_score_ge", STRING_SCORE_CUTOFF),
+  outdir = DIR_FIG,
+  width = 12,
+  height = 10,
+  dpi = 360
+)
+
+############################################################
+## 16. Top hub 基因柱状图
+############################################################
+
+top_hub_df <- nodes_metrics %>%
+  dplyr::arrange(dplyr::desc(weighted_degree), dplyr::desc(degree)) %>%
+  dplyr::slice_head(n = TOP_HUB_BAR_N) %>%
+  dplyr::mutate(
+    gene_symbol = factor(gene_symbol, levels = rev(gene_symbol)),
+    node_class = ifelse(is_key_gene, "Key gene", "Other")
+  )
+
+p_top_hub <- ggplot(
+  top_hub_df,
+  aes(
+    x = gene_symbol,
+    y = weighted_degree,
+    fill = node_class
+  )
+) +
+  geom_col(width = 0.75) +
+  coord_flip() +
+  scale_fill_manual(
+    values = c(
+      "Key gene" = "#D73027",
+      "Other" = "grey70"
+    ),
+    name = ""
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(color = "black"),
+    axis.title = element_text(color = "black"),
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      color = "black"
+    ),
+    plot.subtitle = element_text(
+      hjust = 0.5,
+      color = "grey30"
+    ),
+    legend.position = "top"
+  ) +
+  labs(
+    title = paste0("Top ", TOP_HUB_BAR_N, " hub genes in PPI network"),
+    subtitle = "Ranked by weighted degree",
+    x = "",
+    y = "Weighted degree"
+  )
+
+save_pdf_png(
+  p_top_hub,
+  prefix = paste0("Figure_03_top", TOP_HUB_BAR_N, "_hub_genes_weighted_degree"),
+  outdir = DIR_FIG,
+  width = 8,
+  height = 8.5,
+  dpi = 360
+)
+
+############################################################
+## 17. 关键基因 weighted degree 柱状图
+############################################################
+
+if (nrow(key_nodes_metrics) > 0) {
+  
+  key_bar_df <- key_nodes_metrics %>%
+    dplyr::arrange(dplyr::desc(weighted_degree), dplyr::desc(degree)) %>%
+    dplyr::mutate(
+      gene_symbol = factor(gene_symbol, levels = rev(gene_symbol))
+    )
+  
+  p_key_bar <- ggplot(
+    key_bar_df,
+    aes(
+      x = gene_symbol,
+      y = weighted_degree
+    )
+  ) +
+    geom_col(
+      width = 0.75,
+      fill = "#D73027"
+    ) +
+    coord_flip() +
+    theme_bw(base_size = 12) +
+    theme(
+      panel.grid.minor = element_blank(),
+      axis.text = element_text(color = "black"),
+      axis.title = element_text(color = "black"),
+      plot.title = element_text(
+        hjust = 0.5,
+        face = "bold",
+        color = "black"
+      ),
+      plot.subtitle = element_text(
+        hjust = 0.5,
+        color = "grey30"
+      )
+    ) +
+    labs(
+      title = "Predefined key genes in PPI network",
+      subtitle = "Ranked by weighted degree",
+      x = "",
+      y = "Weighted degree"
+    )
+  
+} else {
+  
+  p_key_bar <- make_empty_plot(
+    title_text = "No predefined key genes in PPI network",
+    subtitle_text = "Please check key gene summary table."
+  )
+}
+
+save_pdf_png(
+  p_key_bar,
+  prefix = "Figure_04_key_genes_weighted_degree_barplot",
+  outdir = DIR_FIG,
+  width = 8,
+  height = 8.5,
+  dpi = 360
+)
+
+############################################################
+## 18. 网络统计汇总
+############################################################
+
+network_summary <- data.frame(
+  item = c(
+    "input_common_gene_file",
+    "output_dir",
+    "STRING_species",
+    "STRING_version_used",
+    "STRING_score_cutoff",
+    "n_input_common_genes",
+    "n_STRING_mapped_genes",
+    "n_STRING_unmapped_genes",
+    "n_PPI_nodes",
+    "n_PPI_edges",
+    "n_connected_components",
+    "largest_component_size",
+    "n_key_genes_input_unique",
+    "n_key_match_candidates_with_alias",
+    "n_key_nodes_in_PPI_network",
+    "node_size_meaning",
+    "edge_width_meaning"
+  ),
+  value = c(
+    IN_COMMON_GENE,
+    OUTDIR,
+    STRING_SPECIES,
+    STRING_VERSION_USED,
+    STRING_SCORE_CUTOFF,
+    length(common_genes),
+    nrow(mapped_ok),
+    nrow(unmapped),
+    nrow(nodes_metrics),
+    nrow(ppi_edges_final),
+    length(comp$csize),
+    max(comp$csize),
+    length(key_direct_unique),
+    nrow(key_match_df),
+    nrow(key_nodes_metrics),
+    "weighted_degree",
+    "STRING_combined_score"
+  ),
+  stringsAsFactors = FALSE
+)
+
+write.csv(
+  network_summary,
+  file.path(DIR_TAB, "00_PPI_network_summary.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## 19. Excel 汇总
+############################################################
+
+xlsx_file <- file.path(DIR_XLSX, "Tstage_common_genes_PPI_STRING_results.xlsx")
+
+excel_list <- list(
+  summary = network_summary,
+  input_common_genes = input_gene_df,
+  STRING_mapped_all = mapped,
+  STRING_unmapped = unmapped,
+  PPI_edges_raw = ppi_raw2,
+  PPI_edges_filtered = ppi_edges_final,
+  PPI_nodes_metrics = nodes_metrics,
+  key_input_clean = key_direct_df,
+  key_match_alias = key_match_df,
+  key_summary = key_gene_summary,
+  key_nodes_metrics = key_nodes_metrics,
+  cytoscape_nodes = cyto_nodes,
+  cytoscape_edges = cyto_edges
+)
+
+names(excel_list) <- safe_sheet(names(excel_list))
+
+openxlsx::write.xlsx(
+  excel_list,
+  file = xlsx_file,
+  overwrite = TRUE
+)
+
+############################################################
+## 20. 保存 RDS 和 sessionInfo
+############################################################
+
+rds_file <- file.path(DIR_RDS, "Tstage_common_genes_PPI_STRING_result.rds")
+
+saveRDS(
+  list(
+    parameters = list(
+      IN_COMMON_GENE = IN_COMMON_GENE,
+      OUTDIR = OUTDIR,
+      STRING_SPECIES = STRING_SPECIES,
+      STRING_VERSION_USED = STRING_VERSION_USED,
+      STRING_SCORE_CUTOFF = STRING_SCORE_CUTOFF,
+      node_size_meaning = "weighted_degree",
+      edge_width_meaning = "STRING combined_score"
+    ),
+    input_common_genes = input_gene_df,
+    key_match_df = key_match_df,
+    mapped = mapped,
+    unmapped = unmapped,
+    ppi_raw = ppi_raw2,
+    ppi_edges = ppi_edges_final,
+    nodes_metrics = nodes_metrics,
+    key_gene_summary = key_gene_summary,
+    key_nodes_metrics = key_nodes_metrics,
+    graph = g,
+    layout = layout_df,
+    network_summary = network_summary
+  ),
+  rds_file
+)
+
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(OUTDIR, "sessionInfo_Tstage_common_genes_PPI_STRING.txt")
+)
+
+############################################################
+## 21. 完成提示
+############################################################
+
+message("============================================================")
+message("完成：T 分期交集基因 PPI 分析")
+message("输出目录：", OUTDIR)
+message("原始 PPI 图：")
+message(file.path(DIR_FIG, paste0("Figure_01_raw_PPI_network_STRING_score_ge", STRING_SCORE_CUTOFF, ".pdf")))
+message("关键基因标红 PPI 图：")
+message(file.path(DIR_FIG, paste0("Figure_02_key_gene_highlighted_PPI_network_STRING_score_ge", STRING_SCORE_CUTOFF, ".pdf")))
+message("节点指标表：")
+message(file.path(DIR_TAB, "08_PPI_nodes_with_network_metrics_and_key_flag.csv"))
+message("关键基因量化表：")
+message(file.path(DIR_KEY, "04_key_genes_in_PPI_network_metrics.csv"))
+message("Cytoscape 节点文件：")
+message(file.path(DIR_NET, "PPI_nodes_for_Cytoscape.csv"))
+message("Cytoscape 边文件：")
+message(file.path(DIR_NET, "PPI_edges_for_Cytoscape.csv"))
+message("Excel 汇总：", xlsx_file)
+message("RDS：", rds_file)
+message("============================================================")
+
+print(network_summary)
+print(
+  key_nodes_metrics %>%
+    dplyr::select(
+      gene_symbol,
+      key_gene_input_matched,
+      degree,
+      weighted_degree,
+      betweenness,
+      closeness,
+      weighted_degree_rank
+    ) %>%
+    dplyr::arrange(weighted_degree_rank)
+)
