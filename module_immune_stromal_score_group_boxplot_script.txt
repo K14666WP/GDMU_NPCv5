@@ -1,0 +1,1754 @@
+############################################################
+## 鼻咽癌：circle-level 64类 xCell Immune/Stromal 高低组箱图
+
+## 核心逻辑：
+## 1. 只使用 64 类 xCell cell type 压缩为 Immune cells / Stromal cells
+## 2. 不使用 ImmuneScore / StromaScore
+## 3. 先得到每个 HNas circle 的全局 Immune/Stromal 分数
+## 4. 按 circle-level Immune/Stromal 中位数分 High/Low
+## 5. 比较五个模块在 High/Low 组间的 mean module score
+## 6. 临床分组按 T / N / 复发 / 分化四个三列无表头 Excel 读取
+##
+## 输出：
+## /media/desk16/iy2142/鼻咽癌课题/箱图
+############################################################
+
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+set.seed(123)
+
+############################################################
+## 0. 路径
+############################################################
+
+ROOT_XCELL <- "/media/desk16/iy2142/鼻咽癌课题/03_xCell_marker_hotspot_distance"
+
+OUTDIR <- "/media/desk16/iy2142/鼻咽癌课题/箱图"
+
+DIR_TAB <- file.path(OUTDIR, "01_tables")
+DIR_FIG_INF <- file.path(OUTDIR, "02_boxplots_infiltration_high_low")
+DIR_FIG_CLI <- file.path(OUTDIR, "03_boxplots_clinical_groups")
+DIR_XLSX <- file.path(OUTDIR, "04_excel")
+DIR_RDS <- file.path(OUTDIR, "00_Robject")
+
+dir.create(OUTDIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_TAB, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_FIG_INF, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_FIG_CLI, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_XLSX, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_RDS, recursive = TRUE, showWarnings = FALSE)
+
+############################################################
+## 1. 参数
+############################################################
+
+MAIN_SECTION <- "LR_combined"
+
+GROUP_ORDER <- c("Hotspot", "Near", "Middle", "Far")
+
+MODULE_ORDER_FINAL <- c(
+  "no-senescence apCAF",
+  "pre-senescence apCAF",
+  "senescence apCAF",
+  "ECM senescence apCAF",
+  "SASP senescence apCAF"
+)
+
+INFILTRATION_TYPES <- c("Immune cells", "Stromal cells")
+
+CLEAR_OLD_FIGURES <- TRUE
+
+############################################################
+## 2. 加载包
+############################################################
+
+need_pkgs <- c(
+  "dplyr",
+  "tidyr",
+  "ggplot2",
+  "readxl",
+  "openxlsx",
+  "stringr"
+)
+
+for (p in need_pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    stop("缺少 R 包：", p, "，请先安装。")
+  }
+}
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(readxl)
+  library(openxlsx)
+  library(stringr)
+})
+
+############################################################
+## 3. 清理旧图
+############################################################
+
+if (CLEAR_OLD_FIGURES) {
+  old_inf <- list.files(
+    DIR_FIG_INF,
+    pattern = "\\.(pdf|png)$",
+    full.names = TRUE
+  )
+  
+  old_cli <- list.files(
+    DIR_FIG_CLI,
+    pattern = "\\.(pdf|png)$",
+    full.names = TRUE
+  )
+  
+  if (length(old_inf) > 0) {
+    unlink(old_inf)
+    message("已删除旧免疫/基质箱图数量：", length(old_inf))
+  }
+  
+  if (length(old_cli) > 0) {
+    unlink(old_cli)
+    message("已删除旧临床箱图数量：", length(old_cli))
+  }
+}
+
+############################################################
+## 4. 工具函数
+############################################################
+
+safe_z <- function(x) {
+  x <- as.numeric(x)
+  out <- rep(NA_real_, length(x))
+  ok <- is.finite(x)
+  
+  if (sum(ok) == 0) return(out)
+  if (sum(ok) < 2) {
+    out[ok] <- 0
+    return(out)
+  }
+  
+  m <- mean(x[ok], na.rm = TRUE)
+  s <- sd(x[ok], na.rm = TRUE)
+  
+  if (!is.finite(s) || s == 0) {
+    out[ok] <- 0
+  } else {
+    out[ok] <- (x[ok] - m) / s
+  }
+  
+  out
+}
+
+weighted_mean_safe <- function(x, w = NULL) {
+  x <- as.numeric(x)
+  
+  if (is.null(w)) {
+    w <- rep(1, length(x))
+  }
+  
+  w <- as.numeric(w)
+  
+  ok <- is.finite(x) & is.finite(w) & w > 0
+  
+  if (sum(ok) == 0) return(NA_real_)
+  
+  sum(x[ok] * w[ok], na.rm = TRUE) / sum(w[ok], na.rm = TRUE)
+}
+
+norm_key <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x <- tolower(x)
+  x <- gsub("[[:space:][:punct:]_\\-]+", "", x, perl = TRUE)
+  x
+}
+
+sanitize_filename <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x <- iconv(x, from = "", to = "ASCII//TRANSLIT", sub = "_")
+  x <- gsub("[\r\n\t]+", " ", x)
+  x <- gsub("\\s+", "_", x)
+  x <- gsub("[/\\\\:*?\"<>|]", "_", x, perl = TRUE)
+  x <- gsub("[^A-Za-z0-9_.-]+", "_", x, perl = TRUE)
+  x <- gsub("_+", "_", x)
+  x <- gsub("^[_\\.]+|[_\\.]+$", "", x)
+  ifelse(is.na(x) | x == "", "unknown", x)
+}
+
+normalize_group <- function(x) {
+  y <- tolower(trimws(as.character(x)))
+  y <- gsub("[[:space:]_\\-]+", "", y)
+  
+  dplyr::case_when(
+    y %in% c("hotspot", "hot", "core") ~ "Hotspot",
+    y %in% c("near") ~ "Near",
+    y %in% c("middle", "mid") ~ "Middle",
+    y %in% c("far") ~ "Far",
+    TRUE ~ NA_character_
+  )
+}
+
+normalize_section <- function(x) {
+  y <- as.character(x)
+  k <- norm_key(y)
+  
+  dplyr::case_when(
+    k %in% c("lrcombined", "lr", "combined") ~ "LR_combined",
+    grepl("lrcombined", k) ~ "LR_combined",
+    grepl("combined", k) ~ "LR_combined",
+    k == "l" ~ "L",
+    k == "r" ~ "R",
+    grepl("l$", k) & !grepl("lr|combined", k) ~ "L",
+    grepl("r$", k) & !grepl("lr|combined", k) ~ "R",
+    TRUE ~ y
+  )
+}
+
+clean_hnas <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x <- gsub("^L_", "", x, ignore.case = TRUE)
+  x <- gsub("^R_", "", x, ignore.case = TRUE)
+  x <- gsub("^HNASN091SU01_L_", "", x, ignore.case = TRUE)
+  x <- gsub("^HNASN091SU01_R_", "", x, ignore.case = TRUE)
+  x <- gsub("^HNas_N091Su01_L_", "", x, ignore.case = TRUE)
+  x <- gsub("^HNas_N091Su01_R_", "", x, ignore.case = TRUE)
+  x <- gsub("\\.0$", "", x)
+  x
+}
+
+clean_spot_id <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x <- gsub("\"", "", x)
+  x <- gsub("'", "", x)
+  x <- gsub("^\\s+|\\s+$", "", x)
+  x
+}
+
+fix_module_name <- function(x) {
+  x0 <- as.character(x)
+  k <- norm_key(x0)
+  
+  out <- rep(NA_character_, length(k))
+  
+  out[grepl("ecmapcafmarkerassociatedecm", k)] <- "REMOVE_ECM_marker_associated_ECM"
+  out[grepl("saspapcafmarkerassociatedsasp", k)] <- "REMOVE_SASP_marker_associated_SASP"
+  
+  out[is.na(out) & grepl("^otherapcaf$", k)] <- "no-senescence apCAF"
+  out[is.na(out) & grepl("otherapcaf", k)] <- "no-senescence apCAF"
+  out[is.na(out) & grepl("nosenescenceapcaf", k)] <- "no-senescence apCAF"
+  
+  out[is.na(out) & grepl("presenescenceapcaf", k)] <- "pre-senescence apCAF"
+  out[is.na(out) & grepl("presenescentapcaf", k)] <- "pre-senescence apCAF"
+  out[is.na(out) & grepl("presenescence", k)] <- "pre-senescence apCAF"
+  out[is.na(out) & grepl("presenescent", k)] <- "pre-senescence apCAF"
+  
+  out[is.na(out) & grepl("ecmsenescenceapcaf", k)] <- "ECM senescence apCAF"
+  out[is.na(out) & grepl("ecmsenescentapcaf", k)] <- "ECM senescence apCAF"
+  
+  out[is.na(out) & grepl("saspsenescenceapcaf", k)] <- "SASP senescence apCAF"
+  out[is.na(out) & grepl("saspsenescentapcaf", k)] <- "SASP senescence apCAF"
+  
+  out[is.na(out) & grepl("^senescenceapcaf$", k)] <- "senescence apCAF"
+  out[is.na(out) & grepl("^senescentapcaf$", k)] <- "senescence apCAF"
+  
+  out[is.na(out)] <- x0[is.na(out)]
+  
+  out
+}
+
+module_source_priority <- function(module_label_original) {
+  k <- norm_key(module_label_original)
+  
+  dplyr::case_when(
+    grepl("otherapcaf", k) ~ 1L,
+    grepl("nosenescenceapcaf", k) ~ 2L,
+    TRUE ~ 1L
+  )
+}
+
+find_first_col <- function(df, candidates) {
+  hit <- candidates[candidates %in% colnames(df)]
+  if (length(hit) == 0) return(NA_character_)
+  hit[1]
+}
+
+count_spots_in_string <- function(x) {
+  x <- as.character(x)
+  x <- gsub("\\[|\\]|\"", "", x)
+  x <- gsub("'", "", x)
+  out <- unlist(strsplit(x, split = "[,;|[:space:]]+"))
+  out <- clean_spot_id(out)
+  out <- out[!is.na(out) & out != ""]
+  length(unique(out))
+}
+
+make_p_label <- function(p) {
+  dplyr::case_when(
+    is.na(p) ~ "p = NA",
+    p < 0.001 ~ "p < 0.001",
+    TRUE ~ paste0("p = ", signif(p, 3))
+  )
+}
+
+theme_box <- function(base_size = 11) {
+  theme_bw(base_size = base_size) +
+    theme(
+      text = element_text(color = "black"),
+      axis.text = element_text(color = "black"),
+      axis.title = element_text(color = "black"),
+      strip.text = element_text(color = "black", face = "bold"),
+      strip.background = element_rect(fill = "grey95", color = "grey70"),
+      panel.grid.minor = element_blank(),
+      panel.grid.major.x = element_blank(),
+      legend.position = "none",
+      plot.title = element_text(face = "bold", hjust = 0.5, color = "black"),
+      plot.subtitle = element_text(hjust = 0.5, color = "grey30")
+    )
+}
+
+save_pdf_png <- function(p, prefix, outdir, width = 13, height = 8.5) {
+  dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+  
+  pdf_file <- file.path(outdir, paste0(prefix, ".pdf"))
+  png_file <- file.path(outdir, paste0(prefix, ".png"))
+  
+  grDevices::pdf(
+    file = pdf_file,
+    width = width,
+    height = height,
+    useDingbats = FALSE,
+    onefile = TRUE
+  )
+  print(p)
+  grDevices::dev.off()
+  
+  ggplot2::ggsave(
+    filename = png_file,
+    plot = p,
+    width = width,
+    height = height,
+    dpi = 320,
+    bg = "white",
+    limitsize = FALSE
+  )
+  
+  message("[PDF] ", pdf_file)
+  message("[PNG] ", png_file)
+}
+
+first_existing <- function(paths) {
+  hit <- paths[file.exists(paths)]
+  if (length(hit) == 0) return(NA_character_)
+  hit[1]
+}
+
+############################################################
+## 5. 64类 xCell -> Immune / Stromal 映射
+############################################################
+
+immune_cells <- c(
+  "CD4+ T-cells",
+  "CD4+ naive T-cells",
+  "CD4+ memory T-cells",
+  "CD4+ Tcm",
+  "CD4+ Tem",
+  "CD8+ T-cells",
+  "CD8+ naive T-cells",
+  "CD8+ Tcm",
+  "CD8+ Tem",
+  "Th1 cells",
+  "Th2 cells",
+  "Tregs",
+  "Tgd cells",
+  "B-cells",
+  "naive B-cells",
+  "Memory B-cells",
+  "Class-switched memory B-cells",
+  "Plasma cells",
+  "pro B-cells",
+  "NK cells",
+  "NKT",
+  "DC",
+  "aDC",
+  "cDC",
+  "iDC",
+  "pDC",
+  "Monocytes",
+  "Macrophages",
+  "Macrophages M1",
+  "Macrophages M2",
+  "Neutrophils",
+  "Eosinophils",
+  "Basophils",
+  "Mast cells"
+)
+
+stromal_cells <- c(
+  "Fibroblasts",
+  "MSC",
+  "Endothelial cells",
+  "mv Endothelial cells",
+  "ly Endothelial cells",
+  "Pericytes",
+  "Myocytes",
+  "Skeletal muscle",
+  "Smooth muscle",
+  "Adipocytes",
+  "Preadipocytes",
+  "Osteoblast",
+  "Osteoblasts",
+  "Chondrocytes"
+)
+
+celltype_to_category <- dplyr::bind_rows(
+  data.frame(
+    xcell_celltype = immune_cells,
+    cell_category = "Immune cells",
+    stringsAsFactors = FALSE
+  ),
+  data.frame(
+    xcell_celltype = stromal_cells,
+    cell_category = "Stromal cells",
+    stringsAsFactors = FALSE
+  )
+) %>%
+  dplyr::distinct(xcell_celltype, .keep_all = TRUE)
+
+write.csv(
+  celltype_to_category,
+  file.path(DIR_TAB, "00_xCell_64_to_Immune_Stromal_mapping.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## 6. 搜索模块文件
+############################################################
+
+if (!dir.exists(ROOT_XCELL)) {
+  stop("找不到 ROOT_XCELL：", ROOT_XCELL)
+}
+
+all_csv_files <- list.files(
+  ROOT_XCELL,
+  pattern = "\\.csv$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+spot_files <- all_csv_files[
+  grepl("_spot_marker_score_and_distance_group\\.csv$", basename(all_csv_files), ignore.case = TRUE)
+]
+
+sample_info_files <- all_csv_files[
+  grepl("_xCell_pseudobulk_sample_info\\.csv$", basename(all_csv_files), ignore.case = TRUE)
+]
+
+xcell_long_files <- all_csv_files[
+  grepl("_xCell_score_long\\.csv$", basename(all_csv_files), ignore.case = TRUE)
+]
+
+if (length(spot_files) == 0) stop("没有找到 02_*_spot_marker_score_and_distance_group.csv")
+if (length(sample_info_files) == 0) stop("没有找到 05_*_xCell_pseudobulk_sample_info.csv")
+if (length(xcell_long_files) == 0) stop("没有找到 07_*_xCell_score_long.csv")
+
+file_map <- data.frame(
+  module_dir = basename(dirname(dirname(spot_files))),
+  spot_file = spot_files,
+  stringsAsFactors = FALSE
+) %>%
+  dplyr::mutate(module_dir_key = norm_key(module_dir)) %>%
+  dplyr::left_join(
+    data.frame(
+      module_dir_key = norm_key(basename(dirname(dirname(sample_info_files)))),
+      sample_info_file = sample_info_files,
+      stringsAsFactors = FALSE
+    ),
+    by = "module_dir_key"
+  ) %>%
+  dplyr::left_join(
+    data.frame(
+      module_dir_key = norm_key(basename(dirname(dirname(xcell_long_files)))),
+      xcell_long_file = xcell_long_files,
+      stringsAsFactors = FALSE
+    ),
+    by = "module_dir_key"
+  ) %>%
+  dplyr::filter(
+    !is.na(sample_info_file),
+    !is.na(xcell_long_file)
+  )
+
+if (nrow(file_map) == 0) {
+  stop("没有任何模块同时具备 spot_file / sample_info_file / xcell_long_file。")
+}
+
+write.csv(
+  file_map,
+  file.path(DIR_TAB, "01_module_file_map.csv"),
+  row.names = FALSE
+)
+
+message("可分析模块数：", nrow(file_map))
+print(file_map)
+
+############################################################
+## 7. 读取 spot 级模块 score，聚合到 circle 层面
+############################################################
+
+pick_score_col <- function(df) {
+  preferred <- c(
+    "module_score",
+    "marker_score",
+    "module_score_z",
+    "marker_score_z",
+    "score",
+    "spot_score",
+    "UCell_score",
+    "ucell_score"
+  )
+  
+  hit <- preferred[preferred %in% colnames(df)]
+  
+  if (length(hit) > 0) return(hit[1])
+  
+  cn <- colnames(df)
+  
+  cand <- cn[
+    grepl("module.*score|marker.*score|ucell.*score|score", cn, ignore.case = TRUE) &
+      !grepl("xcell|distance|near|far|hotspot|group|mean|median|pct|count|n_", cn, ignore.case = TRUE)
+  ]
+  
+  if (length(cand) > 0) return(cand[1])
+  
+  NA_character_
+}
+
+read_one_spot_circle <- function(f) {
+  
+  df <- read.csv(
+    f,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+  
+  module_col <- find_first_col(df, c("object_label", "module_label", "object_id", "module"))
+  section_col <- find_first_col(df, c("section", "sample_short"))
+  spot_col <- find_first_col(df, c("spot_id", "barcode"))
+  score_col <- pick_score_col(df)
+  circle_col <- find_first_col(df, c("circle_id", "pseudo_circle_id"))
+  hnas_col <- find_first_col(df, c("HNas_code", "hnas_code", "HNas"))
+  
+  if (is.na(module_col)) stop("spot 文件缺少模块列：", f)
+  if (is.na(section_col)) stop("spot 文件缺少 section/sample_short：", f)
+  if (is.na(spot_col)) stop("spot 文件缺少 spot_id/barcode：", f)
+  if (is.na(score_col)) stop("spot 文件缺少 module score：", f)
+  if (is.na(circle_col) && is.na(hnas_col)) stop("spot 文件缺少 circle_id/HNas_code：", f)
+  
+  module_label_original <- unique(na.omit(as.character(df[[module_col]])))[1]
+  module_label <- fix_module_name(module_label_original)
+  
+  if (grepl("^REMOVE_", module_label)) {
+    return(data.frame())
+  }
+  
+  if (!module_label %in% MODULE_ORDER_FINAL) {
+    return(data.frame())
+  }
+  
+  out_spot <- df %>%
+    dplyr::transmute(
+      module_label_original = module_label_original,
+      module_label = module_label,
+      module_key = norm_key(module_label),
+      module_source_priority = module_source_priority(module_label_original),
+      section = normalize_section(.data[[section_col]]),
+      spot_id = clean_spot_id(.data[[spot_col]]),
+      module_score = as.numeric(.data[[score_col]]),
+      circle_id = if (!is.na(circle_col)) as.character(.data[[circle_col]]) else NA_character_,
+      HNas_code = if (!is.na(hnas_col)) as.character(.data[[hnas_col]]) else circle_id,
+      HNas_code_clean = clean_hnas(HNas_code),
+      circle_id_clean = clean_hnas(circle_id),
+      source_file = f
+    ) %>%
+    dplyr::filter(
+      section %in% c("L", "R"),
+      is.finite(module_score),
+      !is.na(spot_id),
+      spot_id != "",
+      !is.na(HNas_code_clean),
+      HNas_code_clean != ""
+    ) %>%
+    dplyr::distinct(section, spot_id, .keep_all = TRUE)
+  
+  out_lr <- out_spot %>%
+    dplyr::group_by(
+      module_label_original,
+      module_label,
+      module_key,
+      module_source_priority,
+      section,
+      HNas_code_clean
+    ) %>%
+    dplyr::summarise(
+      mean_module_score = mean(module_score, na.rm = TRUE),
+      median_module_score = median(module_score, na.rm = TRUE),
+      n_spots_module = dplyr::n(),
+      .groups = "drop"
+    )
+  
+  out_lrc <- out_spot %>%
+    dplyr::mutate(section = "LR_combined") %>%
+    dplyr::group_by(
+      module_label_original,
+      module_label,
+      module_key,
+      module_source_priority,
+      section,
+      HNas_code_clean
+    ) %>%
+    dplyr::summarise(
+      mean_module_score = mean(module_score, na.rm = TRUE),
+      median_module_score = median(module_score, na.rm = TRUE),
+      n_spots_module = dplyr::n(),
+      .groups = "drop"
+    )
+  
+  dplyr::bind_rows(out_lr, out_lrc)
+}
+
+module_expr_circle_raw <- dplyr::bind_rows(
+  lapply(file_map$spot_file, read_one_spot_circle)
+)
+
+if (nrow(module_expr_circle_raw) == 0) {
+  stop("模块 score 聚合后为空。")
+}
+
+## 如果 no-senescence 同时存在 Other apCAF 与原始 no-senescence，优先保留 Other apCAF 映射版
+module_expr_circle <- module_expr_circle_raw %>%
+  dplyr::group_by(module_label) %>%
+  dplyr::mutate(
+    has_priority_1 = any(module_source_priority == 1L)
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::filter(
+    module_label != "no-senescence apCAF" |
+      !has_priority_1 |
+      module_source_priority == 1L
+  ) %>%
+  dplyr::group_by(
+    module_label,
+    module_key,
+    section,
+    HNas_code_clean
+  ) %>%
+  dplyr::summarise(
+    module_label_original = paste(unique(module_label_original), collapse = ";"),
+    mean_module_score = mean(mean_module_score, na.rm = TRUE),
+    median_module_score = median(median_module_score, na.rm = TRUE),
+    n_spots_module = sum(n_spots_module, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    module_label = factor(module_label, levels = MODULE_ORDER_FINAL)
+  )
+
+write.csv(
+  module_expr_circle,
+  file.path(DIR_TAB, "02_module_score_circle_level.csv"),
+  row.names = FALSE
+)
+
+module_expr_lrc <- module_expr_circle %>%
+  dplyr::filter(section == MAIN_SECTION)
+
+if (nrow(module_expr_lrc) == 0) {
+  stop("没有 LR_combined 层面的模块表达数据。")
+}
+
+############################################################
+## 8. 读取 sample_info 与 xCell long，构建 circle-level Immune/Stromal 分数
+############################################################
+
+############################################################
+## 修正版 read_one_sample_info
+## 修复 dplyr::case_when 标量 warning
+############################################################
+
+read_one_sample_info <- function(f, module_label_from_file = NA_character_) {
+  
+  df <- read.csv(
+    f,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+  
+  pseudo_col <- find_first_col(df, c("pseudo_sample_id", "sample_id"))
+  section_col <- find_first_col(df, c("section", "sample_short"))
+  group_col <- find_first_col(df, c("xcell_group", "group", "distance_group", "group_label"))
+  circle_col <- find_first_col(df, c("pseudo_circle_id", "circle_id", "HNas_code", "hnas_code"))
+  hnas_col <- find_first_col(df, c("HNas_code", "hnas_code", "HNas"))
+  spot_ids_col <- find_first_col(df, c("spot_ids", "spots", "spot_id_list", "barcodes", "barcode_list"))
+  n_col <- find_first_col(df, c("n_spots", "spot_count", "n_cells", "nSpot", "n"))
+  
+  if (is.na(pseudo_col)) stop("sample_info 缺少 pseudo_sample_id：", f)
+  if (is.na(section_col)) stop("sample_info 缺少 section：", f)
+  if (is.na(group_col)) stop("sample_info 缺少 xcell_group：", f)
+  
+  ## 这里不用 case_when，避免标量条件 warning
+  if (!is.na(n_col)) {
+    n_spots_vec <- as.numeric(df[[n_col]])
+  } else if (!is.na(spot_ids_col)) {
+    n_spots_vec <- as.numeric(
+      vapply(
+        as.character(df[[spot_ids_col]]),
+        count_spots_in_string,
+        numeric(1)
+      )
+    )
+  } else {
+    n_spots_vec <- rep(1, nrow(df))
+  }
+  
+  out <- df %>%
+    dplyr::mutate(
+      pseudo_sample_id = as.character(.data[[pseudo_col]]),
+      section = normalize_section(.data[[section_col]]),
+      xcell_group = normalize_group(.data[[group_col]]),
+      pseudo_circle_id = if (!is.na(circle_col)) as.character(.data[[circle_col]]) else NA_character_,
+      HNas_code = if (!is.na(hnas_col)) as.character(.data[[hnas_col]]) else pseudo_circle_id,
+      HNas_code_clean = clean_hnas(HNas_code),
+      pseudo_circle_id_clean = clean_hnas(pseudo_circle_id),
+      n_spots_pseudo = n_spots_vec,
+      source_sample_info_file = f
+    ) %>%
+    dplyr::filter(
+      !is.na(pseudo_sample_id),
+      pseudo_sample_id != "",
+      section %in% c("LR_combined", "L", "R"),
+      xcell_group %in% GROUP_ORDER,
+      !is.na(HNas_code_clean),
+      HNas_code_clean != ""
+    ) %>%
+    dplyr::select(
+      pseudo_sample_id,
+      section,
+      xcell_group,
+      pseudo_circle_id,
+      pseudo_circle_id_clean,
+      HNas_code,
+      HNas_code_clean,
+      n_spots_pseudo,
+      source_sample_info_file
+    ) %>%
+    dplyr::distinct(pseudo_sample_id, .keep_all = TRUE)
+  
+  out
+}
+
+
+############################################################
+## 修正版 read_one_xcell_long_raw
+## 修复 left_join 后 section / xcell_group / HNas_code_clean 重名冲突
+## 强制只保留 64 类 xCell，排除 ImmuneScore / StromaScore
+############################################################
+
+read_one_xcell_long_raw <- function(xcell_file, sample_info_file, spot_file) {
+  
+  ##########################################################
+  ## 1. 从 spot 文件读模块名
+  ##########################################################
+  
+  spot_df <- read.csv(
+    spot_file,
+    stringsAsFactors = FALSE,
+    check.names = FALSE,
+    nrows = 10
+  )
+  
+  module_col <- find_first_col(
+    spot_df,
+    c("object_label", "module_label", "object_id", "module")
+  )
+  
+  module_label_original <- if (!is.na(module_col)) {
+    unique(na.omit(as.character(spot_df[[module_col]])))[1]
+  } else {
+    basename(dirname(dirname(spot_file)))
+  }
+  
+  module_label <- fix_module_name(module_label_original)
+  
+  if (grepl("^REMOVE_", module_label) || !module_label %in% MODULE_ORDER_FINAL) {
+    return(data.frame())
+  }
+  
+  ##########################################################
+  ## 2. 读取 sample_info
+  ##########################################################
+  
+  sample_meta <- read_one_sample_info(sample_info_file) %>%
+    dplyr::rename(
+      section_meta = section,
+      xcell_group_meta = xcell_group,
+      pseudo_circle_id_meta = pseudo_circle_id,
+      pseudo_circle_id_clean_meta = pseudo_circle_id_clean,
+      HNas_code_meta = HNas_code,
+      HNas_code_clean_meta = HNas_code_clean,
+      n_spots_pseudo_meta = n_spots_pseudo
+    )
+  
+  ##########################################################
+  ## 3. 读取 xCell long
+  ##########################################################
+  
+  xlong <- read.csv(
+    xcell_file,
+    stringsAsFactors = FALSE,
+    check.names = FALSE
+  )
+  
+  pseudo_col <- find_first_col(xlong, c("pseudo_sample_id", "sample_id"))
+  section_col <- find_first_col(xlong, c("section", "sample_short"))
+  group_col <- find_first_col(xlong, c("xcell_group", "group", "distance_group", "group_label"))
+  circle_col <- find_first_col(xlong, c("pseudo_circle_id", "circle_id", "HNas_code", "hnas_code"))
+  hnas_col <- find_first_col(xlong, c("HNas_code", "hnas_code", "HNas"))
+  celltype_col <- find_first_col(xlong, c("xcell_celltype", "cell_type", "celltype"))
+  score_col <- find_first_col(xlong, c("xcell_score", "score", "adjustedScore", "adjusted_score", "enrichment_score", "raw_score"))
+  
+  if (is.na(pseudo_col)) stop("xCell long 缺少 pseudo_sample_id：", xcell_file)
+  if (is.na(celltype_col)) stop("xCell long 缺少 xcell_celltype：", xcell_file)
+  if (is.na(score_col)) stop("xCell long 缺少 xcell_score：", xcell_file)
+  
+  ## 先只生成不会和 sample_meta 冲突的 *_x 列
+  xraw0 <- xlong %>%
+    dplyr::transmute(
+      pseudo_sample_id = as.character(.data[[pseudo_col]]),
+      section_x = if (!is.na(section_col)) normalize_section(.data[[section_col]]) else NA_character_,
+      xcell_group_x = if (!is.na(group_col)) normalize_group(.data[[group_col]]) else NA_character_,
+      pseudo_circle_id_x = if (!is.na(circle_col)) as.character(.data[[circle_col]]) else NA_character_,
+      HNas_code_x = if (!is.na(hnas_col)) as.character(.data[[hnas_col]]) else pseudo_circle_id_x,
+      HNas_code_clean_x = clean_hnas(HNas_code_x),
+      xcell_celltype = as.character(.data[[celltype_col]]),
+      xcell_score = as.numeric(.data[[score_col]])
+    ) %>%
+    dplyr::filter(
+      !is.na(pseudo_sample_id),
+      pseudo_sample_id != "",
+      is.finite(xcell_score),
+      !xcell_celltype %in% c("ImmuneScore", "StromaScore", "MicroenvironmentScore")
+    )
+  
+  ##########################################################
+  ## 4. 合并 sample_info，优先用 sample_info 的 section/group/HNas
+  ##########################################################
+  
+  xraw <- xraw0 %>%
+    dplyr::left_join(
+      sample_meta,
+      by = "pseudo_sample_id"
+    ) %>%
+    dplyr::mutate(
+      module_label_original = module_label_original,
+      module_label = module_label,
+      module_key = norm_key(module_label),
+      module_source_priority = module_source_priority(module_label_original),
+      
+      section = dplyr::case_when(
+        !is.na(section_meta) & section_meta != "" ~ section_meta,
+        !is.na(section_x) & section_x != "" ~ section_x,
+        TRUE ~ NA_character_
+      ),
+      
+      xcell_group = dplyr::case_when(
+        !is.na(xcell_group_meta) & xcell_group_meta != "" ~ xcell_group_meta,
+        !is.na(xcell_group_x) & xcell_group_x != "" ~ xcell_group_x,
+        TRUE ~ NA_character_
+      ),
+      
+      HNas_code_clean = dplyr::case_when(
+        !is.na(HNas_code_clean_meta) & HNas_code_clean_meta != "" ~ HNas_code_clean_meta,
+        !is.na(HNas_code_clean_x) & HNas_code_clean_x != "" ~ HNas_code_clean_x,
+        TRUE ~ NA_character_
+      ),
+      
+      n_spots_pseudo = ifelse(
+        is.finite(n_spots_pseudo_meta),
+        n_spots_pseudo_meta,
+        1
+      ),
+      
+      source_xcell_file = xcell_file
+    ) %>%
+    dplyr::left_join(
+      celltype_to_category,
+      by = "xcell_celltype"
+    ) %>%
+    dplyr::filter(
+      cell_category %in% INFILTRATION_TYPES,
+      section %in% c("LR_combined", "L", "R"),
+      xcell_group %in% GROUP_ORDER,
+      !is.na(HNas_code_clean),
+      HNas_code_clean != ""
+    ) %>%
+    dplyr::select(
+      module_label_original,
+      module_label,
+      module_key,
+      module_source_priority,
+      pseudo_sample_id,
+      section,
+      xcell_group,
+      HNas_code_clean,
+      xcell_celltype,
+      xcell_score,
+      cell_category,
+      n_spots_pseudo,
+      source_xcell_file,
+      source_sample_info_file
+    )
+  
+  xraw
+}
+xcell_raw_all <- dplyr::bind_rows(
+  lapply(seq_len(nrow(file_map)), function(i) {
+    read_one_xcell_long_raw(
+      xcell_file = file_map$xcell_long_file[i],
+      sample_info_file = file_map$sample_info_file[i],
+      spot_file = file_map$spot_file[i]
+    )
+  })
+)
+
+if (nrow(xcell_raw_all) == 0) {
+  stop("xCell long 映射到 Immune/Stromal 后为空。")
+}
+
+## no-senescence 同源重复时，优先保留 Other apCAF 映射来源
+xcell_raw_all <- xcell_raw_all %>%
+  dplyr::group_by(module_label) %>%
+  dplyr::mutate(has_priority_1 = any(module_source_priority == 1L)) %>%
+  dplyr::ungroup() %>%
+  dplyr::filter(
+    module_label != "no-senescence apCAF" |
+      !has_priority_1 |
+      module_source_priority == 1L
+  )
+
+## 全局按 xCell cell type 做 z-score，再压缩到 Immune/Stromal
+xcell_use_z <- xcell_raw_all %>%
+  dplyr::group_by(xcell_celltype) %>%
+  dplyr::mutate(xcell_score_z = safe_z(xcell_score)) %>%
+  dplyr::ungroup()
+
+xcat_pseudo <- xcell_use_z %>%
+  dplyr::group_by(
+    module_label,
+    module_key,
+    section,
+    HNas_code_clean,
+    xcell_group,
+    pseudo_sample_id,
+    cell_category
+  ) %>%
+  dplyr::summarise(
+    category_score = mean(xcell_score_z, na.rm = TRUE),
+    mean_raw_xcell_score = mean(xcell_score, na.rm = TRUE),
+    n_xcell_celltypes = dplyr::n_distinct(xcell_celltype),
+    n_spots_pseudo = dplyr::first(n_spots_pseudo),
+    .groups = "drop"
+  )
+
+## 每个模块内部，先按 Hotspot/Near/Middle/Far 加权合并到 circle
+xcat_module_circle <- xcat_pseudo %>%
+  dplyr::group_by(
+    module_label,
+    module_key,
+    section,
+    HNas_code_clean,
+    cell_category
+  ) %>%
+  dplyr::summarise(
+    module_circle_category_score = weighted_mean_safe(category_score, n_spots_pseudo),
+    n_pseudosamples = dplyr::n_distinct(pseudo_sample_id),
+    n_spots_total = sum(n_spots_pseudo, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+## 再跨模块平均，得到每个 circle 独立的全局 Immune/Stromal 分数
+if (any(xcat_module_circle$section == "LR_combined")) {
+  xcat_circle_base <- xcat_module_circle %>%
+    dplyr::filter(section == "LR_combined")
+} else {
+  xcat_circle_base <- xcat_module_circle %>%
+    dplyr::filter(section %in% c("L", "R")) %>%
+    dplyr::mutate(section = "LR_combined")
+}
+
+xcat_circle_long <- xcat_circle_base %>%
+  dplyr::group_by(
+    section,
+    HNas_code_clean,
+    cell_category
+  ) %>%
+  dplyr::summarise(
+    circle_category_score = mean(module_circle_category_score, na.rm = TRUE),
+    n_modules_used = dplyr::n_distinct(module_label),
+    .groups = "drop"
+  )
+
+xcat_circle_wide <- xcat_circle_long %>%
+  tidyr::pivot_wider(
+    names_from = cell_category,
+    values_from = circle_category_score
+  )
+
+if (!"Immune cells" %in% colnames(xcat_circle_wide)) {
+  stop("circle-level 结果缺少 Immune cells。")
+}
+
+if (!"Stromal cells" %in% colnames(xcat_circle_wide)) {
+  stop("circle-level 结果缺少 Stromal cells。")
+}
+
+xcat_circle_wide <- xcat_circle_wide %>%
+  dplyr::rename(
+    immune_circle_score = `Immune cells`,
+    stromal_circle_score = `Stromal cells`
+  ) %>%
+  dplyr::mutate(
+    delta_stromal_minus_immune = stromal_circle_score - immune_circle_score
+  )
+
+write.csv(
+  xcell_raw_all,
+  file.path(DIR_TAB, "03_xCell_long_64cell_raw_used.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  xcat_pseudo,
+  file.path(DIR_TAB, "04_xCell_64cell_pseudosample_category_score.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  xcat_module_circle,
+  file.path(DIR_TAB, "05_xCell_64cell_module_circle_category_score.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  xcat_circle_wide,
+  file.path(DIR_TAB, "06_xCell_64cell_global_circle_Immune_Stromal_score.csv"),
+  row.names = FALSE
+)
+
+message("circle-level Immune/Stromal 分数数量：", nrow(xcat_circle_wide))
+
+############################################################
+## 9. 按 circle-level Immune/Stromal 分高低组，比较模块表达
+############################################################
+
+circle_group_long <- xcat_circle_wide %>%
+  dplyr::select(
+    HNas_code_clean,
+    immune_circle_score,
+    stromal_circle_score,
+    delta_stromal_minus_immune
+  ) %>%
+  tidyr::pivot_longer(
+    cols = c(immune_circle_score, stromal_circle_score),
+    names_to = "infiltration_type_raw",
+    values_to = "infiltration_score"
+  ) %>%
+  dplyr::mutate(
+    infiltration_type = dplyr::case_when(
+      infiltration_type_raw == "immune_circle_score" ~ "Immune cells",
+      infiltration_type_raw == "stromal_circle_score" ~ "Stromal cells",
+      TRUE ~ infiltration_type_raw
+    )
+  ) %>%
+  dplyr::group_by(infiltration_type) %>%
+  dplyr::mutate(
+    cutoff_median = median(infiltration_score, na.rm = TRUE),
+    infiltration_group = ifelse(
+      infiltration_score >= cutoff_median,
+      "High",
+      "Low"
+    )
+  ) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    infiltration_type = factor(infiltration_type, levels = INFILTRATION_TYPES),
+    infiltration_group = factor(infiltration_group, levels = c("Low", "High"))
+  )
+
+infiltration_analysis <- module_expr_lrc %>%
+  dplyr::left_join(
+    circle_group_long,
+    by = "HNas_code_clean"
+  ) %>%
+  dplyr::filter(
+    !is.na(infiltration_type),
+    !is.na(infiltration_group),
+    is.finite(mean_module_score),
+    is.finite(infiltration_score)
+  ) %>%
+  dplyr::mutate(
+    module_label = factor(as.character(module_label), levels = MODULE_ORDER_FINAL)
+  )
+
+if (nrow(infiltration_analysis) == 0) {
+  stop("模块表达与 circle-level Immune/Stromal 分数合并后为空。")
+}
+
+write.csv(
+  circle_group_long,
+  file.path(DIR_TAB, "07_circle_Immune_Stromal_high_low_group.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  infiltration_analysis,
+  file.path(DIR_TAB, "08_infiltration_high_low_circle_level_analysis.csv"),
+  row.names = FALSE
+)
+
+calc_wilcox_infil <- function(df) {
+  df %>%
+    dplyr::group_by(module_label) %>%
+    dplyr::summarise(
+      n_total = dplyr::n(),
+      n_low = sum(infiltration_group == "Low", na.rm = TRUE),
+      n_high = sum(infiltration_group == "High", na.rm = TRUE),
+      mean_low = mean(mean_module_score[infiltration_group == "Low"], na.rm = TRUE),
+      mean_high = mean(mean_module_score[infiltration_group == "High"], na.rm = TRUE),
+      p_value = tryCatch(
+        wilcox.test(mean_module_score ~ infiltration_group)$p.value,
+        error = function(e) NA_real_
+      ),
+      y_pos = {
+        rg <- range(mean_module_score, na.rm = TRUE)
+        if (!all(is.finite(rg)) || rg[1] == rg[2]) {
+          max(mean_module_score, na.rm = TRUE) + 0.1
+        } else {
+          max(mean_module_score, na.rm = TRUE) + 0.08 * diff(rg)
+        }
+      },
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      p_adj_BH = p.adjust(p_value, method = "BH"),
+      p_label = make_p_label(p_value)
+    )
+}
+
+plot_infil_box <- function(df, type_use) {
+  
+  stat_df <- calc_wilcox_infil(df)
+  stat_df$infiltration_type <- type_use
+  
+  p <- ggplot(
+    df,
+    aes(
+      x = infiltration_group,
+      y = mean_module_score,
+      fill = infiltration_group
+    )
+  ) +
+    geom_boxplot(
+      outlier.shape = NA,
+      width = 0.60,
+      linewidth = 0.30
+    ) +
+    geom_jitter(
+      width = 0.16,
+      size = 1.15,
+      alpha = 0.72
+    ) +
+    geom_text(
+      data = stat_df,
+      aes(
+        x = 1.5,
+        y = y_pos,
+        label = p_label
+      ),
+      inherit.aes = FALSE,
+      size = 3.2,
+      color = "black"
+    ) +
+    facet_wrap(
+      ~ module_label,
+      scales = "free_y",
+      ncol = 3
+    ) +
+    scale_fill_manual(
+      values = c(
+        "Low" = "#4C78A8",
+        "High" = "#E45756"
+      )
+    ) +
+    theme_box(base_size = 11) +
+    labs(
+      title = paste0("Module score comparison between ", type_use, " high and low groups"),
+      subtitle = "Grouping method: global circle-level 64 xCell category score; cutoff = median across circles",
+      x = paste0(type_use, " group"),
+      y = "Mean module score"
+    )
+  
+  list(plot = p, stats = stat_df)
+}
+
+infil_stats_list <- list()
+
+for (type_use in INFILTRATION_TYPES) {
+  
+  dd <- infiltration_analysis %>%
+    dplyr::filter(infiltration_type == type_use)
+  
+  obj <- plot_infil_box(dd, type_use)
+  
+  prefix <- ifelse(
+    type_use == "Immune cells",
+    "Figure_01_circle_level_Immune_64cell_High_vs_Low_module_score",
+    "Figure_02_circle_level_Stromal_64cell_High_vs_Low_module_score"
+  )
+  
+  save_pdf_png(
+    obj$plot,
+    prefix = prefix,
+    outdir = DIR_FIG_INF,
+    width = 13,
+    height = 8.5
+  )
+  
+  infil_stats_list[[type_use]] <- obj$stats
+}
+
+infiltration_stats <- dplyr::bind_rows(infil_stats_list)
+
+write.csv(
+  infiltration_stats,
+  file.path(DIR_TAB, "09_infiltration_high_low_circle_level_wilcox_stats.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## 10. 临床文件：只读取 T / N / 复发 / 分化四个指定文件
+############################################################
+
+CLINICAL_FILE_MAP <- data.frame(
+  clinical_var = c("T_stage", "N_stage", "Recurrence", "Differentiation"),
+  file = c(
+    first_existing(c(
+      "/media/desk16/iy2142/鼻咽癌课题/临床下的xcell/临床信息/T.xlsx",
+      "/media/desk16/iy2142/鼻咽癌课题/临床下的xcell/临床信息/T(1).xlsx",
+      "/media/desk16/iy2142/鼻咽癌课题/临床性状矩阵/鼻咽癌/T.xlsx",
+      "/media/desk16/iy2142/鼻咽癌课题/临床性状矩阵/鼻咽癌/HNasN091Su01临床数据_ver2_T.xlsx"
+    )),
+    first_existing(c(
+      "/media/desk16/iy2142/鼻咽癌课题/临床下的xcell/临床信息/N.xlsx",
+      "/media/desk16/iy2142/鼻咽癌课题/临床下的xcell/临床信息/N(1).xlsx",
+      "/media/desk16/iy2142/鼻咽癌课题/临床性状矩阵/鼻咽癌/N.xlsx",
+      "/media/desk16/iy2142/鼻咽癌课题/临床性状矩阵/鼻咽癌/HNasN091Su01临床数据_ver3_N.xlsx"
+    )),
+    first_existing(c(
+      "/media/desk16/iy2142/鼻咽癌课题/临床下的xcell/临床信息/复发.xlsx",
+      "/media/desk16/iy2142/鼻咽癌课题/临床下的xcell/临床信息/复发(1).xlsx",
+      "/media/desk16/iy2142/鼻咽癌课题/临床性状矩阵/鼻咽癌/复发.xlsx",
+      "/media/desk16/iy2142/鼻咽癌课题/临床性状矩阵/鼻咽癌/HNasN091Su01临床数据_ver4_复发.xlsx"
+    )),
+    first_existing(c(
+      "/media/desk16/iy2142/鼻咽癌课题/临床下的xcell/临床信息/分化.xlsx",
+      "/media/desk16/iy2142/鼻咽癌课题/临床下的xcell/临床信息/分化(1).xlsx",
+      "/media/desk16/iy2142/鼻咽癌课题/临床性状矩阵/鼻咽癌/分化.xlsx",
+      "/media/desk16/iy2142/鼻咽癌课题/临床性状矩阵/鼻咽癌/HNasN091Su01临床数据_ver1_分化.xlsx"
+    ))
+  ),
+  stringsAsFactors = FALSE
+)
+
+write.csv(
+  CLINICAL_FILE_MAP,
+  file.path(DIR_TAB, "10_clinical_exact4_file_map.csv"),
+  row.names = FALSE
+)
+
+if (any(is.na(CLINICAL_FILE_MAP$file))) {
+  print(CLINICAL_FILE_MAP)
+  stop("有临床文件没有找到，请查看：", file.path(DIR_TAB, "10_clinical_exact4_file_map.csv"))
+}
+
+standardize_clin_group <- function(x, var) {
+  y0 <- trimws(as.character(x))
+  yl <- tolower(y0)
+  
+  if (var == "T_stage") {
+    tval <- stringr::str_extract(toupper(y0), "T[1-4]")
+    return(
+      dplyr::case_when(
+        tval %in% c("T1", "T2") ~ "T1-2",
+        tval %in% c("T3", "T4") ~ "T3-4",
+        TRUE ~ NA_character_
+      )
+    )
+  }
+  
+  if (var == "N_stage") {
+    nval <- stringr::str_extract(toupper(y0), "N[0-3]")
+    return(
+      dplyr::case_when(
+        grepl("无|否|阴性|negative|no|none|0", yl) ~ "N0",
+        grepl("有|是|阳性|positive|yes|1", yl) ~ "N+",
+        nval == "N0" ~ "N0",
+        nval %in% c("N1", "N2", "N3") ~ "N+",
+        TRUE ~ NA_character_
+      )
+    )
+  }
+  
+  if (var == "Recurrence") {
+    return(
+      dplyr::case_when(
+        grepl("无复发|未复发|无|否|no|none|0", yl) ~ "No",
+        grepl("复发|有|是|yes|1", yl) ~ "Yes",
+        TRUE ~ NA_character_
+      )
+    )
+  }
+  
+  if (var == "Differentiation") {
+    return(
+      dplyr::case_when(
+        grepl("未分化", y0) ~ "非角化未分化型",
+        grepl("分化", y0) ~ "非角化分化型",
+        TRUE ~ y0
+      )
+    )
+  }
+  
+  y0
+}
+
+group_order_by_var <- function(var) {
+  if (var == "T_stage") return(c("T1-2", "T3-4"))
+  if (var == "N_stage") return(c("N0", "N+"))
+  if (var == "Recurrence") return(c("No", "Yes"))
+  if (var == "Differentiation") return(c("非角化未分化型", "非角化分化型"))
+  NULL
+}
+
+read_one_exact_clinical <- function(file, var) {
+  
+  message("读取临床文件：", var, " | ", file)
+  
+  raw <- readxl::read_excel(
+    path = file,
+    col_names = FALSE
+  )
+  
+  raw <- as.data.frame(raw)
+  
+  if (ncol(raw) < 3) {
+    stop("临床文件列数不足 3 列：", file)
+  }
+  
+  df <- raw[, 1:3]
+  colnames(df) <- c("region_id", "D07_sample_id", "clinical_value_raw")
+  
+  out <- df %>%
+    dplyr::mutate(
+      clinical_var = var,
+      region_id = trimws(as.character(region_id)),
+      D07_sample_id = trimws(as.character(D07_sample_id)),
+      clinical_value_raw = trimws(as.character(clinical_value_raw)),
+      clinical_group = standardize_clin_group(clinical_value_raw, var),
+      source_file = file
+    ) %>%
+    dplyr::filter(
+      !is.na(region_id),
+      region_id != "",
+      !is.na(D07_sample_id),
+      D07_sample_id != "",
+      !is.na(clinical_group),
+      clinical_group != ""
+    )
+  
+  out
+}
+
+clinical_long_raw <- dplyr::bind_rows(
+  lapply(seq_len(nrow(CLINICAL_FILE_MAP)), function(i) {
+    read_one_exact_clinical(
+      file = CLINICAL_FILE_MAP$file[i],
+      var = CLINICAL_FILE_MAP$clinical_var[i]
+    )
+  })
+)
+
+write.csv(
+  clinical_long_raw,
+  file.path(DIR_TAB, "11_clinical_exact4_raw_long.csv"),
+  row.names = FALSE
+)
+
+clinical_key <- dplyr::bind_rows(
+  clinical_long_raw %>%
+    dplyr::transmute(
+      clinical_var,
+      match_key = clean_hnas(region_id),
+      match_key_type = "region_id",
+      region_id,
+      D07_sample_id,
+      clinical_value_raw,
+      clinical_group,
+      source_file
+    ),
+  clinical_long_raw %>%
+    dplyr::transmute(
+      clinical_var,
+      match_key = clean_hnas(D07_sample_id),
+      match_key_type = "D07_sample_id",
+      region_id,
+      D07_sample_id,
+      clinical_value_raw,
+      clinical_group,
+      source_file
+    )
+) %>%
+  dplyr::filter(
+    !is.na(match_key),
+    match_key != ""
+  ) %>%
+  dplyr::distinct(
+    clinical_var,
+    match_key,
+    clinical_group,
+    .keep_all = TRUE
+  )
+
+clinical_conflict <- clinical_key %>%
+  dplyr::group_by(clinical_var, match_key) %>%
+  dplyr::summarise(
+    n_group = dplyr::n_distinct(clinical_group),
+    groups = paste(unique(clinical_group), collapse = ";"),
+    .groups = "drop"
+  ) %>%
+  dplyr::filter(n_group > 1)
+
+write.csv(
+  clinical_conflict,
+  file.path(DIR_TAB, "12_clinical_conflict_keys.csv"),
+  row.names = FALSE
+)
+
+clinical_key_clean <- clinical_key %>%
+  dplyr::anti_join(
+    clinical_conflict %>%
+      dplyr::select(clinical_var, match_key),
+    by = c("clinical_var", "match_key")
+  ) %>%
+  dplyr::distinct(
+    clinical_var,
+    match_key,
+    .keep_all = TRUE
+  )
+
+write.csv(
+  clinical_key_clean,
+  file.path(DIR_TAB, "13_clinical_key_table_clean.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## 11. 临床分组箱图
+############################################################
+
+clinical_analysis <- module_expr_lrc %>%
+  dplyr::mutate(
+    match_key = clean_hnas(HNas_code_clean),
+    module_label = factor(as.character(module_label), levels = MODULE_ORDER_FINAL)
+  ) %>%
+  dplyr::left_join(
+    clinical_key_clean %>%
+      dplyr::select(
+        clinical_var,
+        match_key,
+        match_key_type,
+        region_id,
+        D07_sample_id,
+        clinical_group,
+        clinical_value_raw,
+        source_file
+      ),
+    by = "match_key"
+  ) %>%
+  dplyr::filter(
+    !is.na(clinical_var),
+    !is.na(clinical_group),
+    clinical_group != ""
+  )
+
+write.csv(
+  clinical_analysis,
+  file.path(DIR_TAB, "14_clinical_analysis_table.csv"),
+  row.names = FALSE
+)
+
+if (nrow(clinical_analysis) == 0) {
+  stop("临床信息与模块表达没有匹配上。")
+}
+
+calc_clinical_stats <- function(dd, var_use, levs_expected) {
+  dd %>%
+    dplyr::group_by(module_label) %>%
+    dplyr::summarise(
+      n_total = dplyr::n(),
+      group_1 = levs_expected[1],
+      group_2 = levs_expected[2],
+      n_group_1 = sum(clinical_group == levs_expected[1], na.rm = TRUE),
+      n_group_2 = sum(clinical_group == levs_expected[2], na.rm = TRUE),
+      mean_group_1 = mean(mean_module_score[clinical_group == levs_expected[1]], na.rm = TRUE),
+      mean_group_2 = mean(mean_module_score[clinical_group == levs_expected[2]], na.rm = TRUE),
+      p_value = tryCatch(
+        wilcox.test(mean_module_score ~ clinical_group)$p.value,
+        error = function(e) NA_real_
+      ),
+      y_pos = {
+        rg <- range(mean_module_score, na.rm = TRUE)
+        if (!all(is.finite(rg)) || rg[1] == rg[2]) {
+          max(mean_module_score, na.rm = TRUE) + 0.1
+        } else {
+          max(mean_module_score, na.rm = TRUE) + 0.08 * diff(rg)
+        }
+      },
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      clinical_var = var_use,
+      p_adj_BH = p.adjust(p_value, method = "BH"),
+      p_label = make_p_label(p_value)
+    )
+}
+
+clinical_stats_all <- list()
+clinical_skip_all <- list()
+
+clinical_vars <- c("T_stage", "N_stage", "Recurrence", "Differentiation")
+
+for (var_use in clinical_vars) {
+  
+  levs_expected <- group_order_by_var(var_use)
+  
+  dd <- clinical_analysis %>%
+    dplyr::filter(
+      clinical_var == var_use,
+      clinical_group %in% levs_expected
+    ) %>%
+    dplyr::mutate(
+      clinical_group = factor(clinical_group, levels = levs_expected),
+      module_label = factor(as.character(module_label), levels = MODULE_ORDER_FINAL)
+    )
+  
+  group_count <- dd %>%
+    dplyr::count(clinical_group) %>%
+    dplyr::filter(n > 0)
+  
+  if (nrow(group_count) < 2) {
+    clinical_skip_all[[length(clinical_skip_all) + 1]] <- data.frame(
+      clinical_var = var_use,
+      reason = paste0(
+        "Less than two groups after filtering. Groups = ",
+        paste(group_count$clinical_group, collapse = ";")
+      ),
+      stringsAsFactors = FALSE
+    )
+    next
+  }
+  
+  stat_df <- calc_clinical_stats(dd, var_use, levs_expected)
+  clinical_stats_all[[var_use]] <- stat_df
+  
+  p <- ggplot(
+    dd,
+    aes(
+      x = clinical_group,
+      y = mean_module_score,
+      fill = clinical_group
+    )
+  ) +
+    geom_boxplot(
+      outlier.shape = NA,
+      width = 0.60,
+      linewidth = 0.30
+    ) +
+    geom_jitter(
+      width = 0.16,
+      size = 1.15,
+      alpha = 0.72
+    ) +
+    geom_text(
+      data = stat_df,
+      aes(
+        x = 1.5,
+        y = y_pos,
+        label = p_label
+      ),
+      inherit.aes = FALSE,
+      size = 3.2,
+      color = "black"
+    ) +
+    facet_wrap(
+      ~ module_label,
+      scales = "free_y",
+      ncol = 3
+    ) +
+    theme_box(base_size = 11) +
+    labs(
+      title = paste0("Module score comparison by clinical group: ", var_use),
+      subtitle = paste0("Clinical groups: ", paste(levs_expected, collapse = " vs ")),
+      x = var_use,
+      y = "Mean module score"
+    )
+  
+  save_pdf_png(
+    p,
+    prefix = paste0("Clinical_", sanitize_filename(var_use), "_module_score_boxplot"),
+    outdir = DIR_FIG_CLI,
+    width = 13,
+    height = 8.5
+  )
+}
+
+clinical_stats_df <- dplyr::bind_rows(clinical_stats_all)
+clinical_skip_df <- dplyr::bind_rows(clinical_skip_all)
+
+write.csv(
+  clinical_stats_df,
+  file.path(DIR_TAB, "15_clinical_wilcox_stats.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  clinical_skip_df,
+  file.path(DIR_TAB, "16_clinical_skipped_variables.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## 12. Excel / RDS 汇总
+############################################################
+
+excel_file <- file.path(
+  DIR_XLSX,
+  "circle_level_64xCell_Immune_Stromal_and_clinical_boxplots.xlsx"
+)
+
+rds_file <- file.path(
+  DIR_RDS,
+  "01_circle_level_64xCell_Immune_Stromal_and_clinical_boxplots.rds"
+)
+
+session_file <- file.path(
+  OUTDIR,
+  "sessionInfo_circle_level_64xCell_Immune_Stromal_boxplots.txt"
+)
+
+openxlsx::write.xlsx(
+  list(
+    mapping = celltype_to_category,
+    file_map = file_map,
+    module_expr = module_expr_circle,
+    xcell_pseudo = xcat_pseudo,
+    xcell_mod_circle = xcat_module_circle,
+    xcell_circle = xcat_circle_wide,
+    circle_groups = circle_group_long,
+    infil_analysis = infiltration_analysis,
+    infil_stats = infiltration_stats,
+    clinical_raw = clinical_long_raw,
+    clinical_analysis = clinical_analysis,
+    clinical_stats = clinical_stats_df,
+    clinical_skip = clinical_skip_df
+  ),
+  file = excel_file,
+  overwrite = TRUE
+)
+
+saveRDS(
+  list(
+    celltype_to_category = celltype_to_category,
+    file_map = file_map,
+    module_expr_circle = module_expr_circle,
+    module_expr_lrc = module_expr_lrc,
+    xcell_raw_all = xcell_raw_all,
+    xcat_pseudo = xcat_pseudo,
+    xcat_module_circle = xcat_module_circle,
+    xcat_circle_wide = xcat_circle_wide,
+    circle_group_long = circle_group_long,
+    infiltration_analysis = infiltration_analysis,
+    infiltration_stats = infiltration_stats,
+    clinical_file_map = CLINICAL_FILE_MAP,
+    clinical_long_raw = clinical_long_raw,
+    clinical_key_clean = clinical_key_clean,
+    clinical_conflict = clinical_conflict,
+    clinical_analysis = clinical_analysis,
+    clinical_stats_df = clinical_stats_df,
+    clinical_skip_df = clinical_skip_df,
+    parameters = list(
+      ROOT_XCELL = ROOT_XCELL,
+      OUTDIR = OUTDIR,
+      MAIN_SECTION = MAIN_SECTION,
+      GROUP_ORDER = GROUP_ORDER,
+      MODULE_ORDER_FINAL = MODULE_ORDER_FINAL,
+      note = "Only 64 xCell cell types were compressed into Immune/Stromal. ImmuneScore and StromaScore were not used. High/low groups were assigned at global circle level."
+    )
+  ),
+  file = rds_file
+)
+
+writeLines(
+  capture.output(sessionInfo()),
+  session_file
+)
+
+############################################################
+## 13. 完成
+############################################################
+
+pdf_files <- list.files(
+  OUTDIR,
+  pattern = "\\.pdf$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+png_files <- list.files(
+  OUTDIR,
+  pattern = "\\.png$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+message("============================================================")
+message("完成：circle-level 64类 xCell Immune/Stromal 高低组 + 临床箱图")
+message("输出目录：", OUTDIR)
+message("免疫/基质箱图目录：", DIR_FIG_INF)
+message("临床箱图目录：", DIR_FIG_CLI)
+message("PDF 数量：", length(pdf_files))
+message("PNG 数量：", length(png_files))
+message("Excel：", excel_file)
+message("RDS：", rds_file)
+message("sessionInfo：", session_file)
+message("============================================================")
+
+print(pdf_files)
+
+if (length(pdf_files) == 0) {
+  stop("没有输出任何 PDF。")
+}

@@ -1,0 +1,2175 @@
+############################################################
+## 鼻咽癌空间转录组：COL1A1 单基因 CAF 拟时序 + UCell 打分
+##
+## 输出：
+## /media/desk16/iy2142/鼻咽癌课题/单基因CAF拟时序
+##
+## 核心：
+## 1. 原始 L/R SpaceRanger counts 重新读取
+## 2. 基础 QC 后，只用 COL1A1 筛 CAF-related spots
+## 3. 重新构建 Monocle2
+## 4. 使用 marker 表重新 UCell 打分
+## 5. 组图顺序按你参考图：
+##    Tumor / myCAF / iCAF / apCAF
+##    non-senescence / senescence / pre-senescence / other
+##    ECM senescent / ECM derived ECM / SASP senescent / SASP derived SASP
+## 6. 额外输出整体拟时序图 + Cluster state 色块图
+############################################################
+
+rm(list = ls())
+options(stringsAsFactors = FALSE)
+set.seed(123)
+
+############################################################
+## 0. 路径
+############################################################
+
+L_OUTS <- "/media/desk16/iy2142/鼻咽癌L_output_final2/outs"
+R_OUTS <- "/media/desk16/iy2142/鼻咽癌R_output_final2/outs"
+
+CLIN_DIR <- "/media/desk16/iy2142/鼻咽癌课题/临床性状矩阵/鼻咽癌"
+
+L_HNAS_FILE <- file.path(CLIN_DIR, "HNas_N091Su01_L.csv")
+R_HNAS_FILE <- file.path(CLIN_DIR, "HNas_N091Su01_R.csv")
+
+DIFF_FILE <- file.path(CLIN_DIR, "HNasN091Su01临床数据_ver1_分化.xlsx")
+T_FILE    <- file.path(CLIN_DIR, "HNasN091Su01临床数据_ver2_T.xlsx")
+N_FILE    <- file.path(CLIN_DIR, "HNasN091Su01临床数据_ver3_N.xlsx")
+REC_FILE  <- file.path(CLIN_DIR, "HNasN091Su01临床数据_ver4_复发.xlsx")
+
+MARKER_FILE <- "/media/desk16/iy2142/鼻咽癌课题/空间转录组marker整理.xlsx"
+
+OUTDIR <- "/media/desk16/iy2142/鼻咽癌课题/单基因CAF拟时序"
+
+RUN_TAG <- "COL1A1_single_CAF"
+
+DIR_RDS     <- file.path(OUTDIR, "00_Robject")
+DIR_TAB     <- file.path(OUTDIR, "01_tables")
+DIR_QC      <- file.path(OUTDIR, "02_COL1A1_CAF_QC_figures")
+DIR_OVERALL <- file.path(OUTDIR, "03_overall_pseudotime_state_figures")
+DIR_TRAJ    <- file.path(OUTDIR, "04_module_trajectory_figures")
+DIR_COMP    <- file.path(OUTDIR, "05_composite_figures")
+DIR_TREND   <- file.path(OUTDIR, "06_trend_figures_no_points")
+DIR_HEAT    <- file.path(OUTDIR, "07_heatmaps")
+DIR_XLSX    <- file.path(OUTDIR, "08_excel")
+
+dir.create(DIR_RDS, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_TAB, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_QC, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_OVERALL, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_TRAJ, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_COMP, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_TREND, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_HEAT, recursive = TRUE, showWarnings = FALSE)
+dir.create(DIR_XLSX, recursive = TRUE, showWarnings = FALSE)
+
+############################################################
+## 1. 参数
+############################################################
+
+SAMPLE_L <- "HNasN091Su01_L"
+SAMPLE_R <- "HNasN091Su01_R"
+
+## 基础 spot QC
+USE_IN_TISSUE_ONLY <- TRUE
+MIN_UMI <- 100
+MIN_FEATURE <- 50
+MAX_PERCENT_MT <- 30
+
+## 单基因 CAF 筛选：只用 COL1A1
+CAF_CLASSIC_MARKERS <- c("COL1A1")
+MIN_CAF_MARKERS_DETECTED <- 1
+
+## COL1A1 阳性 spots 中，保留 COL1A1 score 排名前 50%
+## 如果想保留全部 COL1A1 阳性 spot，把这里改成 0
+COL1A1_SCORE_KEEP_Q <- 0.50
+
+MIN_CAF_SPOTS <- 1200
+
+## Monocle2
+LOWER_DETECTION_LIMIT <- 0.5
+DETECT_MIN_EXPR <- 0.1
+
+N_ORDERING_GENES <- 1600
+ORDERING_MEAN_EXPR_MIN <- 0.10
+ORDERING_DETECT_RATE_MIN <- 0.03
+ORDERING_DETECT_RATE_MAX <- 0.90
+
+EXCLUDE_BAD_GENE_REGEX <- "^(MT-|RPL|RPS|HB[ABDEGQM]|IG[HKL]|TR[ABDG][VCJ]|MALAT1$|XIST$|HIST|MIR|SNORD|SNORA|KRTAP|KRT[0-9]|KRTCAP)"
+
+## UCell 参数：保持之前不变
+UCELL_MAX_RANK <- 1500
+UCELL_NCORES <- 4
+
+N_PSEUDOTIME_BINS <- 60
+CLIP_MODULE_Z <- 2.5
+
+POINT_SIZE <- 0.36
+POINT_ALPHA <- 0.90
+EDGE_SIZE <- 0.50
+EDGE_ALPHA <- 0.85
+
+## 拟时序颜色：沿用之前连续过渡色
+PSEUDOTIME_COLORS_B <- c(
+  "#313695",
+  "#1E88E5",
+  "#00ACC1",
+  "#43A047",
+  "#C0CA33",
+  "#FFD54F",
+  "#FB8C00",
+  "#E53935",
+  "#7F0000"
+)
+
+PSEUDOTIME_VALUES_B <- c(
+  0.00,
+  0.08,
+  0.16,
+  0.28,
+  0.42,
+  0.56,
+  0.72,
+  0.88,
+  1.00
+)
+
+MODULE_LOW <- "#2166AC"
+MODULE_MID <- "#F7F7F7"
+MODULE_HIGH <- "#B2182B"
+BACKGROUND_GREY <- "grey90"
+
+############################################################
+## 2. 加载包
+############################################################
+
+need_pkgs <- c(
+  "Seurat",
+  "Matrix",
+  "monocle",
+  "VGAM",
+  "Biobase",
+  "dplyr",
+  "tidyr",
+  "ggplot2",
+  "scales",
+  "patchwork",
+  "readxl",
+  "openxlsx",
+  "UCell"
+)
+
+for (p in need_pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    stop("缺少 R 包：", p, "。如果缺少 UCell，请先运行：BiocManager::install('UCell')")
+  }
+}
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Matrix)
+  library(monocle)
+  library(VGAM)
+  library(Biobase)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(scales)
+  library(patchwork)
+  library(readxl)
+  library(openxlsx)
+  library(UCell)
+})
+
+select    <- dplyr::select
+filter    <- dplyr::filter
+mutate    <- dplyr::mutate
+arrange   <- dplyr::arrange
+distinct  <- dplyr::distinct
+left_join <- dplyr::left_join
+bind_rows <- dplyr::bind_rows
+group_by  <- dplyr::group_by
+summarise <- dplyr::summarise
+ungroup   <- dplyr::ungroup
+case_when <- dplyr::case_when
+count     <- dplyr::count
+
+############################################################
+## 3. 通用函数
+############################################################
+
+safe_z <- function(x) {
+  x <- as.numeric(x)
+  out <- rep(NA_real_, length(x))
+  ok <- is.finite(x)
+  
+  if (sum(ok) == 0) return(out)
+  
+  m <- mean(x[ok], na.rm = TRUE)
+  s <- sd(x[ok], na.rm = TRUE)
+  
+  if (!is.finite(s) || s == 0) {
+    out[ok] <- 0
+  } else {
+    out[ok] <- (x[ok] - m) / s
+  }
+  
+  out
+}
+
+minmax_01 <- function(x) {
+  x <- as.numeric(x)
+  out <- rep(NA_real_, length(x))
+  ok <- is.finite(x)
+  
+  if (sum(ok) == 0) return(out)
+  
+  mn <- min(x[ok], na.rm = TRUE)
+  mx <- max(x[ok], na.rm = TRUE)
+  
+  if (!is.finite(mx - mn) || mx == mn) {
+    out[ok] <- 0
+  } else {
+    out[ok] <- (x[ok] - mn) / (mx - mn)
+  }
+  
+  out
+}
+
+clean_gene_key <- function(x) {
+  x <- toupper(as.character(x))
+  x <- trimws(x)
+  x <- gsub("\\s+", "", x)
+  x <- gsub("[^A-Z0-9\\-]", "", x)
+  x
+}
+
+sanitize_name <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x <- gsub("[\r\n\t]+", " ", x)
+  x <- gsub("\\s+", "_", x)
+  x <- gsub("[^A-Za-z0-9_\\u4e00-\\u9fa5]", "_", x)
+  x <- gsub("_+", "_", x)
+  x <- gsub("^_|_$", "", x)
+  ifelse(x == "", "module", x)
+}
+
+norm_label <- function(x) {
+  x <- tolower(as.character(x))
+  x <- gsub("[^a-z0-9]+", "", x)
+  x
+}
+
+make_key <- function(x) {
+  x <- as.character(x)
+  x <- basename(x)
+  x <- trimws(x)
+  x <- gsub("\\s+", "", x)
+  x <- gsub("\"", "", x)
+  x <- gsub("'", "", x)
+  toupper(x)
+}
+
+barcode_core <- function(x) {
+  x <- make_key(x)
+  x <- gsub("^HNASN091SU01_L_", "", x)
+  x <- gsub("^HNASN091SU01_R_", "", x)
+  x <- gsub("^L_", "", x)
+  x <- gsub("^R_", "", x)
+  x <- gsub("-[0-9]+$", "", x)
+  x
+}
+
+make_spot_id <- function(barcode, sample_id) {
+  paste0(sample_id, "_", as.character(barcode))
+}
+
+dedup_genes_keep_high_mean <- function(mat) {
+  gene <- rownames(mat)
+  
+  if (!anyDuplicated(gene)) return(mat)
+  
+  gene_mean <- Matrix::rowMeans(mat)
+  
+  df <- data.frame(
+    gene = gene,
+    idx = seq_along(gene),
+    mean_expr = as.numeric(gene_mean),
+    stringsAsFactors = FALSE
+  ) %>%
+    arrange(gene, desc(mean_expr)) %>%
+    distinct(gene, .keep_all = TRUE)
+  
+  mat2 <- mat[df$idx, , drop = FALSE]
+  rownames(mat2) <- df$gene
+  
+  mat2
+}
+
+merge_sparse_by_gene <- function(mat_list) {
+  all_genes <- unique(unlist(lapply(mat_list, rownames)))
+  all_cells <- unlist(lapply(mat_list, colnames))
+  
+  out_list <- lapply(mat_list, function(m) {
+    miss <- setdiff(all_genes, rownames(m))
+    
+    if (length(miss) > 0) {
+      zero <- Matrix::Matrix(
+        0,
+        nrow = length(miss),
+        ncol = ncol(m),
+        sparse = TRUE,
+        dimnames = list(miss, colnames(m))
+      )
+      
+      m <- rbind(m, zero)
+    }
+    
+    m[all_genes, , drop = FALSE]
+  })
+  
+  merged <- do.call(cbind, out_list)
+  merged[, all_cells, drop = FALSE]
+}
+
+read_counts_from_outs <- function(outs_dir, sample_id) {
+  h5_filtered <- file.path(outs_dir, "filtered_feature_bc_matrix.h5")
+  mtx_filtered <- file.path(outs_dir, "filtered_feature_bc_matrix")
+  h5_raw <- file.path(outs_dir, "raw_feature_bc_matrix.h5")
+  
+  if (file.exists(h5_filtered)) {
+    message("读取 filtered h5：", h5_filtered)
+    counts <- Seurat::Read10X_h5(h5_filtered)
+  } else if (dir.exists(mtx_filtered)) {
+    message("读取 filtered mtx：", mtx_filtered)
+    counts <- Seurat::Read10X(mtx_filtered)
+  } else if (file.exists(h5_raw)) {
+    message("读取 raw h5：", h5_raw)
+    counts <- Seurat::Read10X_h5(h5_raw)
+  } else {
+    stop("找不到表达矩阵：", outs_dir)
+  }
+  
+  if (is.list(counts)) {
+    if ("Gene Expression" %in% names(counts)) {
+      counts <- counts[["Gene Expression"]]
+    } else {
+      counts <- counts[[1]]
+    }
+  }
+  
+  counts <- as(counts, "dgCMatrix")
+  colnames(counts) <- make_spot_id(colnames(counts), sample_id)
+  
+  counts
+}
+
+read_spatial_positions <- function(outs_dir, sample_id) {
+  spatial_dir <- file.path(outs_dir, "spatial")
+  
+  f1 <- file.path(spatial_dir, "tissue_positions.csv")
+  f2 <- file.path(spatial_dir, "tissue_positions_list.csv")
+  
+  if (file.exists(f1)) {
+    pos <- read.csv(f1, stringsAsFactors = FALSE, check.names = FALSE)
+  } else if (file.exists(f2)) {
+    pos <- read.csv(f2, header = FALSE, stringsAsFactors = FALSE, check.names = FALSE)
+    colnames(pos) <- c(
+      "barcode",
+      "in_tissue",
+      "array_row",
+      "array_col",
+      "pxl_row_in_fullres",
+      "pxl_col_in_fullres"
+    )
+  } else {
+    stop("找不到空间坐标文件：", spatial_dir)
+  }
+  
+  if (!"barcode" %in% colnames(pos)) colnames(pos)[1] <- "barcode"
+  if (!"in_tissue" %in% colnames(pos)) pos$in_tissue <- 1
+  if (!"array_row" %in% colnames(pos)) pos$array_row <- NA_real_
+  if (!"array_col" %in% colnames(pos)) pos$array_col <- NA_real_
+  
+  if (!"pxl_row_in_fullres" %in% colnames(pos) ||
+      !"pxl_col_in_fullres" %in% colnames(pos)) {
+    if (all(c("array_row", "array_col") %in% colnames(pos))) {
+      pos$pxl_row_in_fullres <- pos$array_row
+      pos$pxl_col_in_fullres <- pos$array_col
+    } else {
+      stop("空间坐标文件缺少像素坐标：", spatial_dir)
+    }
+  }
+  
+  pos %>%
+    mutate(
+      spot_id = make_spot_id(barcode, sample_id),
+      sample_id = sample_id,
+      sample_short = ifelse(sample_id == SAMPLE_L, "L", "R"),
+      barcode_core = barcode_core(barcode),
+      in_tissue = as.numeric(in_tissue),
+      array_row = as.numeric(array_row),
+      array_col = as.numeric(array_col),
+      pxl_row_in_fullres = as.numeric(pxl_row_in_fullres),
+      pxl_col_in_fullres = as.numeric(pxl_col_in_fullres)
+    ) %>%
+    distinct(spot_id, .keep_all = TRUE)
+}
+
+read_hnas_map <- function(file, sample_short) {
+  if (!file.exists(file)) stop("找不到 HNas 对照文件：", file)
+  
+  df <- read.csv(file, stringsAsFactors = FALSE, check.names = FALSE)
+  
+  if (!"Barcode" %in% colnames(df)) colnames(df)[1] <- "Barcode"
+  if (!"HNas" %in% colnames(df)) colnames(df)[2] <- "HNas"
+  
+  df %>%
+    mutate(
+      sample_short = sample_short,
+      barcode_core = barcode_core(Barcode),
+      HNas_code = toupper(trimws(as.character(HNas))),
+      circle_id = paste0(sample_short, "_", HNas_code)
+    ) %>%
+    filter(
+      !is.na(barcode_core),
+      barcode_core != "",
+      !is.na(HNas_code),
+      HNas_code != ""
+    ) %>%
+    distinct(sample_short, barcode_core, .keep_all = TRUE) %>%
+    select(sample_short, barcode_core, HNas_code, circle_id)
+}
+
+read_clinical3 <- function(file, trait_name) {
+  if (!file.exists(file)) {
+    warning("临床文件不存在，跳过：", file)
+    return(data.frame(HNas_code = character(0)))
+  }
+  
+  df <- as.data.frame(readxl::read_excel(file, col_names = FALSE))
+  
+  if (ncol(df) < 3) {
+    warning("临床文件列数不足，跳过：", file)
+    return(data.frame(HNas_code = character(0)))
+  }
+  
+  df <- df[, 1:3]
+  colnames(df) <- c("HNas_code", "patient_id_tmp", trait_name)
+  
+  df %>%
+    mutate(
+      HNas_code = toupper(trimws(as.character(HNas_code))),
+      !!trait_name := trimws(as.character(.data[[trait_name]]))
+    ) %>%
+    filter(
+      !is.na(HNas_code),
+      HNas_code != ""
+    ) %>%
+    select(HNas_code, all_of(trait_name)) %>%
+    distinct(HNas_code, .keep_all = TRUE)
+}
+
+read_marker_modules_from_excel <- function(file) {
+  if (!file.exists(file)) stop("marker 文件不存在：", file)
+  
+  sheets <- readxl::excel_sheets(file)
+  
+  all_modules <- list()
+  all_meta <- data.frame()
+  
+  for (sh in sheets) {
+    raw <- tryCatch(
+      as.data.frame(readxl::read_excel(file, sheet = sh, col_names = FALSE)),
+      error = function(e) NULL
+    )
+    
+    if (is.null(raw) || nrow(raw) == 0 || ncol(raw) == 0) next
+    
+    raw <- raw[, colSums(!is.na(raw)) > 0, drop = FALSE]
+    
+    if (nrow(raw) == 0 || ncol(raw) == 0) next
+    
+    first_row <- as.character(unlist(raw[1, ]))
+    first_row[is.na(first_row)] <- ""
+    header_cols <- which(trimws(first_row) != "")
+    
+    if (length(header_cols) >= 2) {
+      for (i in header_cols) {
+        label <- trimws(as.character(raw[1, i]))
+        module_id <- sanitize_name(label)
+        
+        genes <- raw[-1, i, drop = TRUE]
+        genes <- as.character(genes)
+        genes <- trimws(genes)
+        genes <- genes[!is.na(genes) & genes != ""]
+        genes <- unique(genes)
+        
+        if (length(genes) == 0) next
+        
+        if (module_id %in% names(all_modules)) {
+          module_id <- paste0(module_id, "_", sanitize_name(sh))
+        }
+        
+        all_modules[[module_id]] <- genes
+        
+        all_meta <- bind_rows(
+          all_meta,
+          data.frame(
+            sheet = sh,
+            module_id = module_id,
+            module_label = label,
+            input_gene = genes,
+            stringsAsFactors = FALSE
+          )
+        )
+      }
+    }
+  }
+  
+  if (length(all_modules) == 0) {
+    stop("marker Excel 没有读到任何模块。请确认第一行是模块名。")
+  }
+  
+  list(
+    modules = all_modules,
+    module_meta = all_meta
+  )
+}
+
+get_mono_fun <- function(fname) {
+  if (exists(fname, envir = asNamespace("monocle"), inherits = FALSE)) {
+    return(get(fname, envir = asNamespace("monocle")))
+  }
+  
+  if (exists(fname, mode = "function")) {
+    return(get(fname, mode = "function"))
+  }
+  
+  stop("找不到 Monocle2 函数：", fname)
+}
+
+get_nb_family <- function() {
+  tryCatch(
+    VGAM::negbinomial.size(),
+    error = function(e) {
+      f <- get("negbinomial.size", envir = asNamespace("VGAM"))
+      f()
+    }
+  )
+}
+
+get_reduced_df <- function(cds) {
+  rd <- tryCatch(monocle::reducedDimS(cds), error = function(e) NULL)
+  
+  if (is.null(rd) && "reducedDimS" %in% slotNames(cds)) {
+    rd <- slot(cds, "reducedDimS")
+  }
+  
+  if (is.null(rd)) stop("无法提取 reducedDimS。")
+  
+  cell_ids <- Biobase::sampleNames(cds)
+  
+  if (nrow(rd) >= 2 && ncol(rd) == length(cell_ids)) {
+    data.frame(
+      spot_id = cell_ids,
+      Component_1 = as.numeric(rd[1, ]),
+      Component_2 = as.numeric(rd[2, ]),
+      stringsAsFactors = FALSE
+    )
+  } else if (ncol(rd) >= 2 && nrow(rd) == length(cell_ids)) {
+    data.frame(
+      spot_id = cell_ids,
+      Component_1 = as.numeric(rd[, 1]),
+      Component_2 = as.numeric(rd[, 2]),
+      stringsAsFactors = FALSE
+    )
+  } else {
+    stop("reducedDimS 维度无法识别。")
+  }
+}
+
+extract_edge_df_from_cds_plot <- function(cds) {
+  p <- tryCatch(
+    monocle::plot_cell_trajectory(cds, color_by = "State"),
+    error = function(e) NULL
+  )
+  
+  if (is.null(p)) return(data.frame())
+  
+  gb <- ggplot2::ggplot_build(p)
+  
+  segs <- lapply(gb$data, function(d) {
+    if (all(c("x", "y", "xend", "yend") %in% colnames(d))) {
+      d[, c("x", "y", "xend", "yend"), drop = FALSE]
+    } else {
+      NULL
+    }
+  })
+  
+  segs <- segs[!vapply(segs, is.null, logical(1))]
+  
+  if (length(segs) == 0) return(data.frame())
+  
+  bind_rows(segs) %>% distinct()
+}
+
+theme_mono_panel <- function(base_size = 9) {
+  theme_void(base_size = base_size) +
+    theme(
+      text = element_text(color = "black"),
+      plot.title = element_text(face = "bold", color = "black", size = base_size + 8),
+      plot.subtitle = element_text(color = "grey35", size = base_size),
+      legend.title = element_text(color = "black", size = base_size),
+      legend.text = element_text(color = "black", size = base_size - 1),
+      plot.background = element_rect(fill = "white", color = NA),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.margin = margin(5, 8, 5, 5)
+    )
+}
+
+theme_mono_axis <- function(base_size = 9) {
+  theme_classic(base_size = base_size) +
+    theme(
+      text = element_text(color = "black"),
+      axis.text = element_text(color = "black"),
+      axis.title = element_text(color = "black"),
+      axis.line = element_line(color = "black", linewidth = 0.35),
+      axis.ticks = element_line(color = "black", linewidth = 0.25),
+      plot.title = element_text(face = "bold", color = "black", size = base_size + 3),
+      plot.subtitle = element_text(color = "grey35", size = base_size - 1),
+      plot.background = element_rect(fill = "white", color = NA),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.margin = margin(5, 8, 5, 5)
+    )
+}
+
+theme_trend <- function(base_size = 11) {
+  theme_classic(base_size = base_size) +
+    theme(
+      text = element_text(color = "black"),
+      axis.text = element_text(color = "black"),
+      axis.title = element_text(color = "black"),
+      axis.line = element_line(color = "black", linewidth = 0.35),
+      axis.ticks = element_line(color = "black", linewidth = 0.25),
+      plot.title = element_text(face = "bold", color = "black", size = base_size + 2),
+      plot.subtitle = element_text(color = "grey35", size = base_size - 1),
+      plot.background = element_rect(fill = "white", color = NA),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.margin = margin(5, 8, 5, 5)
+    )
+}
+
+theme_heat <- function(base_size = 10) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      text = element_text(color = "black"),
+      axis.text.x = element_text(color = "black", angle = 45, hjust = 1),
+      axis.text.y = element_text(color = "black"),
+      panel.grid = element_blank(),
+      plot.title = element_text(face = "bold", color = "black", size = base_size + 4),
+      plot.subtitle = element_text(color = "grey35", size = base_size),
+      plot.background = element_rect(fill = "white", color = NA),
+      panel.background = element_rect(fill = "white", color = NA)
+    )
+}
+
+add_edge_layer <- function(p, edge_df) {
+  if (is.null(edge_df) || !is.data.frame(edge_df) || nrow(edge_df) == 0) {
+    return(p)
+  }
+  
+  if (all(c("x", "y", "xend", "yend") %in% colnames(edge_df))) {
+    p <- p +
+      geom_segment(
+        data = edge_df,
+        aes(x = x, y = y, xend = xend, yend = yend),
+        inherit.aes = FALSE,
+        color = "black",
+        linewidth = EDGE_SIZE,
+        alpha = EDGE_ALPHA
+      )
+  }
+  
+  p
+}
+
+save_pdf_png <- function(p, name, width = 10, height = 7, outdir) {
+  pdf_file <- file.path(outdir, paste0(name, ".pdf"))
+  png_file <- file.path(outdir, paste0(name, ".png"))
+  
+  ggsave(pdf_file, p, width = width, height = height, bg = "white", limitsize = FALSE)
+  ggsave(png_file, p, width = width, height = height, dpi = 320, bg = "white", limitsize = FALSE)
+  
+  message("[PDF] ", pdf_file)
+  message("[PNG] ", png_file)
+}
+
+############################################################
+## 4. 读取 marker 模块并定义顺序
+############################################################
+
+marker_obj <- read_marker_modules_from_excel(MARKER_FILE)
+
+module_list_all <- marker_obj$modules
+module_meta_all <- marker_obj$module_meta
+
+module_lookup <- data.frame(
+  original_module_id = names(module_list_all),
+  module_label = sapply(names(module_list_all), function(x) {
+    lab <- unique(module_meta_all$module_label[module_meta_all$module_id == x])
+    if (length(lab) == 0 || is.na(lab[1]) || lab[1] == "") x else lab[1]
+  }),
+  stringsAsFactors = FALSE
+)
+
+module_lookup$norm_text <- norm_label(
+  paste(module_lookup$original_module_id, module_lookup$module_label)
+)
+
+write.csv(
+  module_meta_all,
+  file.path(DIR_TAB, "00_marker_modules_from_excel.csv"),
+  row.names = FALSE
+)
+
+BASE_DISPLAY_SPEC <- data.frame(
+  display_order = 1:12,
+  display_id = c(
+    "Tumor_cell_expression",
+    "myCAF_expression",
+    "iCAF_expression",
+    "apCAF_expression",
+    "non_senescence_apCAF",
+    "senescence_apCAF",
+    "pre_senescence_apCAF",
+    "other_apCAF",
+    "ECM_senescent_apCAF",
+    "ECM_senescent_apCAF_derived_ECM",
+    "SASP_senescent_apCAF",
+    "SASP_senescent_apCAF_derived_SASP"
+  ),
+  display_label = c(
+    "Tumor cell expression",
+    "myCAF expression",
+    "iCAF expression",
+    "apCAF expression",
+    "non-senescence apCAF",
+    "senescence apCAF",
+    "pre-senescence apCAF",
+    "other apCAF",
+    "ECM senescent apCAF",
+    "ECM senescent apCAF derived ECM",
+    "SASP senescent apCAF",
+    "SASP senescent apCAF derived SASP"
+  ),
+  stringsAsFactors = FALSE
+)
+
+manual_find <- function(target, used_ids = character(0)) {
+  lk <- module_lookup %>%
+    filter(!original_module_id %in% used_ids)
+  
+  if (target == "Tumor_cell_expression") {
+    hit <- lk %>% filter(grepl("tumor|epithelial|pithelial", norm_text))
+  } else if (target == "myCAF_expression") {
+    hit <- lk %>% filter(grepl("mycaf|my", norm_text) & grepl("marker|caf", norm_text))
+  } else if (target == "iCAF_expression") {
+    hit <- lk %>% filter(grepl("icaf|imarker|^i", norm_text))
+  } else if (target == "apCAF_expression") {
+    hit <- lk %>%
+      filter(
+        grepl("apcaf|ap", norm_text) &
+          grepl("marker|caf", norm_text) &
+          !grepl("derived|ecm|sasp|senescence|nosenescence|presenescence|other", norm_text)
+      )
+  } else if (target == "non_senescence_apCAF") {
+    hit <- lk %>% filter(grepl("nosenescence|nonsenescence", norm_text))
+  } else if (target == "senescence_apCAF") {
+    hit <- lk %>%
+      filter(
+        grepl("senescence", norm_text) &
+          grepl("ap|caf", norm_text) &
+          !grepl("no|non|pre|ecm|sasp|derived|other", norm_text)
+      )
+  } else if (target == "pre_senescence_apCAF") {
+    hit <- lk %>% filter(grepl("presenescence|pre", norm_text))
+  } else if (target == "other_apCAF") {
+    hit <- lk %>% filter(grepl("other", norm_text))
+  } else if (target == "ECM_senescent_apCAF") {
+    hit <- lk %>%
+      filter(
+        grepl("ecm", norm_text) &
+          grepl("senescence|senescent", norm_text) &
+          !grepl("derived", norm_text)
+      )
+  } else if (target == "ECM_senescent_apCAF_derived_ECM") {
+    hit <- lk %>%
+      filter(grepl("ecm", norm_text) & grepl("derived", norm_text))
+  } else if (target == "SASP_senescent_apCAF") {
+    hit <- lk %>%
+      filter(
+        grepl("sasp", norm_text) &
+          grepl("senescence|senescent", norm_text) &
+          !grepl("derived", norm_text)
+      )
+  } else if (target == "SASP_senescent_apCAF_derived_SASP") {
+    hit <- lk %>%
+      filter(grepl("sasp", norm_text) & grepl("derived", norm_text))
+  } else {
+    hit <- lk[0, ]
+  }
+  
+  if (nrow(hit) == 0) return(NA_character_)
+  hit$original_module_id[1]
+}
+
+used_ids <- character(0)
+
+BASE_DISPLAY_SPEC$original_module_id <- NA_character_
+BASE_DISPLAY_SPEC$original_module_label <- NA_character_
+BASE_DISPLAY_SPEC$n_input_genes <- NA_integer_
+
+for (i in seq_len(nrow(BASE_DISPLAY_SPEC))) {
+  mid <- manual_find(BASE_DISPLAY_SPEC$display_id[i], used_ids)
+  
+  BASE_DISPLAY_SPEC$original_module_id[i] <- mid
+  
+  if (!is.na(mid)) {
+    used_ids <- c(used_ids, mid)
+    BASE_DISPLAY_SPEC$original_module_label[i] <- module_lookup$module_label[
+      match(mid, module_lookup$original_module_id)
+    ]
+    BASE_DISPLAY_SPEC$n_input_genes[i] <- length(unique(clean_gene_key(module_list_all[[mid]])))
+  }
+}
+
+extra_ids <- setdiff(names(module_list_all), used_ids)
+
+extra_spec <- data.frame()
+
+if (length(extra_ids) > 0) {
+  extra_labels <- module_lookup$module_label[
+    match(extra_ids, module_lookup$original_module_id)
+  ]
+  
+  extra_spec <- data.frame(
+    display_order = seq_len(length(extra_ids)) + nrow(BASE_DISPLAY_SPEC),
+    display_id = make.unique(sanitize_name(extra_labels)),
+    display_label = extra_labels,
+    original_module_id = extra_ids,
+    original_module_label = extra_labels,
+    n_input_genes = sapply(extra_ids, function(x) length(unique(clean_gene_key(module_list_all[[x]])))),
+    stringsAsFactors = FALSE
+  )
+}
+
+MODULE_DISPLAY_SPEC <- bind_rows(BASE_DISPLAY_SPEC, extra_spec)
+
+MODULE_DISPLAY_SPEC_OK <- MODULE_DISPLAY_SPEC %>%
+  filter(!is.na(original_module_id))
+
+write.csv(
+  MODULE_DISPLAY_SPEC,
+  file.path(DIR_TAB, "01_module_display_order_final.csv"),
+  row.names = FALSE
+)
+
+if (nrow(MODULE_DISPLAY_SPEC_OK) == 0) {
+  stop("没有任何模块匹配到，请检查 marker 表。")
+}
+
+module_list_ordered <- list()
+
+for (i in seq_len(nrow(MODULE_DISPLAY_SPEC_OK))) {
+  did <- MODULE_DISPLAY_SPEC_OK$display_id[i]
+  oid <- MODULE_DISPLAY_SPEC_OK$original_module_id[i]
+  module_list_ordered[[did]] <- module_list_all[[oid]]
+}
+
+module_labels_ordered <- setNames(
+  MODULE_DISPLAY_SPEC_OK$display_label,
+  MODULE_DISPLAY_SPEC_OK$display_id
+)
+
+message("最终模块顺序：")
+print(MODULE_DISPLAY_SPEC_OK[, c("display_order", "display_label", "original_module_id", "n_input_genes")])
+
+############################################################
+## 5. 读取 SpaceRanger + 临床
+############################################################
+
+message("========== 读取 SpaceRanger counts ==========")
+
+L_counts <- read_counts_from_outs(L_OUTS, SAMPLE_L)
+R_counts <- read_counts_from_outs(R_OUTS, SAMPLE_R)
+
+L_counts <- dedup_genes_keep_high_mean(L_counts)
+R_counts <- dedup_genes_keep_high_mean(R_counts)
+
+counts_all <- merge_sparse_by_gene(list(L_counts, R_counts))
+counts_all <- dedup_genes_keep_high_mean(counts_all)
+
+rownames(counts_all) <- clean_gene_key(rownames(counts_all))
+counts_all <- dedup_genes_keep_high_mean(counts_all)
+
+message("合并 counts：", nrow(counts_all), " genes x ", ncol(counts_all), " spots")
+
+L_pos <- read_spatial_positions(L_OUTS, SAMPLE_L)
+R_pos <- read_spatial_positions(R_OUTS, SAMPLE_R)
+pos_all <- bind_rows(L_pos, R_pos)
+
+L_hnas <- read_hnas_map(L_HNAS_FILE, "L")
+R_hnas <- read_hnas_map(R_HNAS_FILE, "R")
+hnas_map <- bind_rows(L_hnas, R_hnas)
+
+clin_diff <- read_clinical3(DIFF_FILE, "分化")
+clin_T    <- read_clinical3(T_FILE, "T分期")
+clin_N    <- read_clinical3(N_FILE, "N原始")
+clin_rec  <- read_clinical3(REC_FILE, "复发")
+
+clin_all <- full_join(clin_diff, clin_T, by = "HNas_code") %>%
+  full_join(clin_N, by = "HNas_code") %>%
+  full_join(clin_rec, by = "HNas_code")
+
+write.csv(hnas_map, file.path(DIR_TAB, "02_HNas_barcode_mapping.csv"), row.names = FALSE)
+write.csv(clin_all, file.path(DIR_TAB, "03_HNas_clinical_traits_merged.csv"), row.names = FALSE)
+
+############################################################
+## 6. 基础 QC + COL1A1 单基因 CAF 筛选
+############################################################
+
+message("========== 构建 metadata ==========")
+
+meta <- data.frame(
+  spot_id = colnames(counts_all),
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    sample_id = case_when(
+      grepl("^HNasN091Su01_L_", spot_id) ~ SAMPLE_L,
+      grepl("^HNasN091Su01_R_", spot_id) ~ SAMPLE_R,
+      TRUE ~ NA_character_
+    ),
+    sample_short = case_when(
+      grepl("^HNasN091Su01_L_", spot_id) ~ "L",
+      grepl("^HNasN091Su01_R_", spot_id) ~ "R",
+      TRUE ~ NA_character_
+    ),
+    barcode_core = barcode_core(spot_id)
+  ) %>%
+  left_join(
+    pos_all %>%
+      select(
+        spot_id,
+        barcode,
+        in_tissue,
+        array_row,
+        array_col,
+        pxl_row_in_fullres,
+        pxl_col_in_fullres
+      ),
+    by = "spot_id"
+  ) %>%
+  left_join(
+    hnas_map,
+    by = c("sample_short", "barcode_core")
+  ) %>%
+  left_join(
+    clin_all,
+    by = "HNas_code"
+  )
+
+meta$nCount_RNA <- as.numeric(Matrix::colSums(counts_all[, meta$spot_id, drop = FALSE]))
+meta$nFeature_RNA <- as.numeric(Matrix::colSums(counts_all[, meta$spot_id, drop = FALSE] > 0))
+
+mt_genes <- grep("^MT-", rownames(counts_all), value = TRUE)
+
+if (length(mt_genes) > 0) {
+  meta$percent_mt <- as.numeric(Matrix::colSums(counts_all[mt_genes, meta$spot_id, drop = FALSE])) /
+    pmax(meta$nCount_RNA, 1) * 100
+} else {
+  meta$percent_mt <- 0
+}
+
+meta <- meta %>%
+  mutate(
+    cancer_type = "Nasopharyngeal carcinoma",
+    N分组_统一 = case_when(
+      is.na(N原始) ~ NA_character_,
+      N原始 %in% c("无", "N0", "0", "阴性") ~ "N0",
+      TRUE ~ "N_positive"
+    ),
+    T早晚分组 = case_when(
+      T分期 %in% c("T1", "T2") ~ "T_early",
+      T分期 %in% c("T3", "T4") ~ "T_late",
+      TRUE ~ NA_character_
+    )
+  )
+
+write.csv(meta, file.path(DIR_TAB, "04_metadata_before_QC.csv"), row.names = FALSE)
+
+meta_qc <- meta %>%
+  filter(
+    !is.na(sample_short),
+    !is.na(pxl_row_in_fullres),
+    !is.na(pxl_col_in_fullres),
+    !is.na(HNas_code),
+    nCount_RNA >= MIN_UMI,
+    nFeature_RNA >= MIN_FEATURE,
+    percent_mt <= MAX_PERCENT_MT
+  )
+
+if (USE_IN_TISSUE_ONLY) {
+  meta_qc <- meta_qc %>%
+    filter(is.na(in_tissue) | in_tissue == 1)
+}
+
+meta_qc <- meta_qc %>%
+  distinct(spot_id, .keep_all = TRUE) %>%
+  arrange(spot_id)
+
+counts_qc <- counts_all[, meta_qc$spot_id, drop = FALSE]
+
+message("基础 QC 后 spots：", nrow(meta_qc))
+
+message("========== 使用 COL1A1 单基因筛选 CAF-related spots ==========")
+
+caf_marker_hit <- intersect(clean_gene_key(CAF_CLASSIC_MARKERS), rownames(counts_qc))
+caf_marker_missing <- setdiff(clean_gene_key(CAF_CLASSIC_MARKERS), caf_marker_hit)
+
+if (length(caf_marker_hit) < 1) {
+  stop("COL1A1 在表达矩阵中未匹配到。")
+}
+
+lib_size <- Matrix::colSums(counts_qc)
+lib_size[lib_size == 0] <- 1
+
+norm_counts <- t(t(counts_qc) / lib_size * 10000)
+log_expr_qc <- norm_counts
+log_expr_qc@x <- log1p(log_expr_qc@x)
+
+col1a1_expr <- as.numeric(log_expr_qc[caf_marker_hit[1], meta_qc$spot_id])
+meta_qc$COL1A1_logNorm <- col1a1_expr
+meta_qc$COL1A1_score_z <- safe_z(col1a1_expr)
+meta_qc$COL1A1_detect_positive <- as.numeric(counts_qc[caf_marker_hit[1], meta_qc$spot_id] > 0) >= 1
+
+if (COL1A1_SCORE_KEEP_Q <= 0) {
+  col1a1_score_cut <- -Inf
+} else {
+  col1a1_score_cut <- as.numeric(
+    quantile(
+      meta_qc$COL1A1_score_z[meta_qc$COL1A1_detect_positive],
+      COL1A1_SCORE_KEEP_Q,
+      na.rm = TRUE
+    )
+  )
+}
+
+meta_qc$COL1A1_CAF_related_keep <- meta_qc$COL1A1_detect_positive &
+  meta_qc$COL1A1_score_z >= col1a1_score_cut
+
+meta_caf <- meta_qc %>%
+  filter(COL1A1_CAF_related_keep) %>%
+  arrange(spot_id)
+
+if (nrow(meta_caf) < MIN_CAF_SPOTS) {
+  warning(
+    "COL1A1 高分 CAF spots 少于 MIN_CAF_SPOTS，自动放宽为全部 COL1A1-positive spots。当前：",
+    nrow(meta_caf)
+  )
+  
+  meta_caf <- meta_qc %>%
+    filter(COL1A1_detect_positive) %>%
+    arrange(spot_id)
+  
+  col1a1_score_cut <- -Inf
+}
+
+if (nrow(meta_caf) < MIN_CAF_SPOTS) {
+  stop("COL1A1 CAF-related spots 仍然太少：", nrow(meta_caf))
+}
+
+counts_caf <- counts_qc[, meta_caf$spot_id, drop = FALSE]
+
+qc_summary <- data.frame(
+  item = c(
+    "n_raw_spots",
+    "n_basic_QC_spots",
+    "n_COL1A1_CAF_spots",
+    "CAF_marker_used",
+    "CAF_marker_matched",
+    "CAF_marker_missing",
+    "COL1A1_SCORE_KEEP_Q",
+    "COL1A1_score_cut",
+    "MIN_UMI",
+    "MIN_FEATURE",
+    "MAX_PERCENT_MT"
+  ),
+  value = c(
+    ncol(counts_all),
+    nrow(meta_qc),
+    nrow(meta_caf),
+    paste(CAF_CLASSIC_MARKERS, collapse = ";"),
+    paste(caf_marker_hit, collapse = ";"),
+    paste(caf_marker_missing, collapse = ";"),
+    COL1A1_SCORE_KEEP_Q,
+    col1a1_score_cut,
+    MIN_UMI,
+    MIN_FEATURE,
+    MAX_PERCENT_MT
+  ),
+  stringsAsFactors = FALSE
+)
+
+write.csv(meta_qc, file.path(DIR_TAB, "05_metadata_after_COL1A1_score_all_QC_spots.csv"), row.names = FALSE)
+write.csv(meta_caf, file.path(DIR_TAB, "06_metadata_COL1A1_CAF_spots_used_for_Monocle2.csv"), row.names = FALSE)
+write.csv(qc_summary, file.path(DIR_TAB, "07_COL1A1_CAF_QC_summary.csv"), row.names = FALSE)
+
+message("COL1A1 CAF-related spots：", nrow(meta_caf))
+print(table(meta_caf$sample_short))
+
+############################################################
+## 7. COL1A1 QC 图
+############################################################
+
+p_col1 <- ggplot(meta_qc, aes(COL1A1_score_z)) +
+  geom_histogram(bins = 80, color = "white") +
+  geom_vline(xintercept = col1a1_score_cut, linetype = "dashed", linewidth = 0.7) +
+  theme_classic(base_size = 11) +
+  labs(
+    title = "COL1A1 CAF score distribution",
+    subtitle = paste0("Cutoff quantile = ", COL1A1_SCORE_KEEP_Q, "; cutoff = ", round(col1a1_score_cut, 3)),
+    x = "COL1A1 score z",
+    y = "Spot count"
+  )
+
+p_col2 <- ggplot(meta_qc, aes(sample_short, COL1A1_score_z)) +
+  geom_boxplot(outlier.size = 0.25) +
+  geom_hline(yintercept = col1a1_score_cut, linetype = "dashed", linewidth = 0.6) +
+  theme_classic(base_size = 11) +
+  labs(
+    title = "COL1A1 CAF score by section",
+    x = "Section",
+    y = "COL1A1 score z"
+  )
+
+p_col3 <- ggplot(meta_qc, aes(pxl_col_in_fullres, pxl_row_in_fullres)) +
+  geom_point(aes(color = COL1A1_score_z), size = 0.45, alpha = 0.85) +
+  scale_color_gradient2(
+    low = MODULE_LOW,
+    mid = MODULE_MID,
+    high = MODULE_HIGH,
+    midpoint = 0,
+    oob = scales::squish,
+    name = "COL1A1\nz"
+  ) +
+  scale_y_reverse() +
+  coord_equal() +
+  theme_void(base_size = 10) +
+  theme(
+    plot.title = element_text(face = "bold", color = "black"),
+    legend.title = element_text(color = "black"),
+    legend.text = element_text(color = "black"),
+    plot.background = element_rect(fill = "white", color = NA)
+  ) +
+  labs(title = "Spatial COL1A1 score")
+
+p_col4 <- ggplot(meta_qc, aes(pxl_col_in_fullres, pxl_row_in_fullres)) +
+  geom_point(color = "grey85", size = 0.45, alpha = 0.75) +
+  geom_point(
+    data = meta_qc %>% filter(COL1A1_CAF_related_keep),
+    aes(pxl_col_in_fullres, pxl_row_in_fullres),
+    color = "#B2182B",
+    size = 0.55,
+    alpha = 0.90
+  ) +
+  scale_y_reverse() +
+  coord_equal() +
+  theme_void(base_size = 10) +
+  theme(
+    plot.title = element_text(face = "bold", color = "black"),
+    plot.background = element_rect(fill = "white", color = NA)
+  ) +
+  labs(title = "COL1A1-selected CAF-related spots")
+
+fig_col_qc <- (p_col1 | p_col2) / (p_col3 | p_col4) +
+  patchwork::plot_annotation(
+    title = "CAF-related spot selection based on COL1A1",
+    subtitle = paste0("Selected COL1A1 CAF-related spots = ", nrow(meta_caf), " / ", nrow(meta_qc)),
+    theme = theme(
+      plot.title = element_text(face = "bold", size = 18, color = "black"),
+      plot.subtitle = element_text(size = 11, color = "grey30")
+    )
+  )
+
+save_pdf_png(
+  fig_col_qc,
+  "Figure_QC_01_COL1A1_single_gene_CAF_selection",
+  width = 14,
+  height = 10,
+  outdir = DIR_QC
+)
+
+############################################################
+## 8. 构建 Monocle2 CDS
+############################################################
+
+message("========== 构建 COL1A1 CAF Monocle2 CDS ==========")
+
+mono_newCellDataSet <- get_mono_fun("newCellDataSet")
+mono_estimateSizeFactors <- get_mono_fun("estimateSizeFactors")
+mono_estimateDispersions <- get_mono_fun("estimateDispersions")
+mono_detectGenes <- get_mono_fun("detectGenes")
+mono_dispersionTable <- get_mono_fun("dispersionTable")
+mono_setOrderingFilter <- get_mono_fun("setOrderingFilter")
+mono_reduceDimension <- get_mono_fun("reduceDimension")
+mono_orderCells <- get_mono_fun("orderCells")
+
+common_spots <- intersect(meta_caf$spot_id, colnames(counts_caf))
+common_spots <- meta_caf$spot_id[meta_caf$spot_id %in% common_spots]
+
+counts_traj <- counts_caf[, common_spots, drop = FALSE]
+
+meta_traj <- meta_caf %>%
+  filter(spot_id %in% common_spots)
+
+meta_traj <- meta_traj[match(colnames(counts_traj), meta_traj$spot_id), , drop = FALSE]
+
+if (!identical(colnames(counts_traj), meta_traj$spot_id)) {
+  stop("counts_traj 与 meta_traj 未对齐。")
+}
+
+pd <- as.data.frame(meta_traj, stringsAsFactors = FALSE)
+pd <- pd[, !duplicated(colnames(pd)), drop = FALSE]
+
+pd[] <- lapply(pd, function(x) {
+  if (is.factor(x)) {
+    as.character(x)
+  } else if (inherits(x, "POSIXt")) {
+    as.character(x)
+  } else if (is.list(x)) {
+    as.character(x)
+  } else {
+    x
+  }
+})
+
+rownames(pd) <- pd$spot_id
+
+fd <- data.frame(
+  gene_short_name = rownames(counts_traj),
+  stringsAsFactors = FALSE
+)
+
+rownames(fd) <- rownames(counts_traj)
+
+message("counts_traj: ", nrow(counts_traj), " genes x ", ncol(counts_traj), " spots")
+message("identical(colnames(counts_traj), rownames(pd)) = ", identical(colnames(counts_traj), rownames(pd)))
+
+cds <- mono_newCellDataSet(
+  counts_traj,
+  phenoData = Biobase::AnnotatedDataFrame(data = pd),
+  featureData = Biobase::AnnotatedDataFrame(data = fd),
+  lowerDetectionLimit = LOWER_DETECTION_LIMIT,
+  expressionFamily = get_nb_family()
+)
+
+message("estimateSizeFactors...")
+cds <- mono_estimateSizeFactors(cds)
+
+message("estimateDispersions...")
+cds <- mono_estimateDispersions(cds)
+
+message("detectGenes...")
+cds <- mono_detectGenes(cds, min_expr = DETECT_MIN_EXPR)
+
+############################################################
+## 9. ordering genes
+############################################################
+
+message("========== 选择 ordering genes ==========")
+
+disp_tbl <- mono_dispersionTable(cds)
+
+gene_detect <- Matrix::rowSums(counts_traj > 0)
+
+detect_df <- data.frame(
+  gene_id = names(gene_detect),
+  n_cells_expressed = as.numeric(gene_detect),
+  detect_rate = as.numeric(gene_detect) / ncol(counts_traj),
+  stringsAsFactors = FALSE
+)
+
+ordering_tbl <- disp_tbl %>%
+  left_join(detect_df, by = "gene_id") %>%
+  mutate(
+    extra_dispersion = dispersion_empirical - dispersion_fit,
+    bad_gene = grepl(EXCLUDE_BAD_GENE_REGEX, gene_id, ignore.case = TRUE)
+  ) %>%
+  filter(
+    is.finite(mean_expression),
+    mean_expression >= ORDERING_MEAN_EXPR_MIN,
+    detect_rate >= ORDERING_DETECT_RATE_MIN,
+    detect_rate <= ORDERING_DETECT_RATE_MAX,
+    dispersion_empirical >= dispersion_fit,
+    !bad_gene
+  ) %>%
+  arrange(desc(extra_dispersion))
+
+if (nrow(ordering_tbl) < 300) {
+  warning("严格 ordering gene 过滤后少于 300，自动放宽 mean_expression 到 0.05，detect_rate 到 0.02。")
+  
+  ordering_tbl <- disp_tbl %>%
+    left_join(detect_df, by = "gene_id") %>%
+    mutate(
+      extra_dispersion = dispersion_empirical - dispersion_fit,
+      bad_gene = grepl(EXCLUDE_BAD_GENE_REGEX, gene_id, ignore.case = TRUE)
+    ) %>%
+    filter(
+      is.finite(mean_expression),
+      mean_expression >= 0.05,
+      detect_rate >= 0.02,
+      detect_rate <= 0.95,
+      dispersion_empirical >= dispersion_fit,
+      !bad_gene
+    ) %>%
+    arrange(desc(extra_dispersion))
+}
+
+ordering_genes <- ordering_tbl$gene_id[
+  seq_len(min(N_ORDERING_GENES, nrow(ordering_tbl)))
+]
+
+if (length(ordering_genes) < 200) {
+  stop("ordering genes 太少：", length(ordering_genes))
+}
+
+write.csv(disp_tbl, file.path(DIR_TAB, "08_all_dispersion_table.csv"), row.names = FALSE)
+write.csv(ordering_tbl, file.path(DIR_TAB, "09_ordering_gene_candidates.csv"), row.names = FALSE)
+write.csv(data.frame(ordering_gene = ordering_genes), file.path(DIR_TAB, "10_ordering_genes_used.csv"), row.names = FALSE)
+
+cds <- mono_setOrderingFilter(cds, ordering_genes)
+
+############################################################
+## 10. DDRTree + orderCells
+############################################################
+
+message("========== DDRTree ==========")
+
+cds <- tryCatch(
+  {
+    mono_reduceDimension(
+      cds,
+      max_components = 2,
+      reduction_method = "DDRTree",
+      norm_method = "log",
+      pseudo_expr = 1,
+      verbose = TRUE
+    )
+  },
+  error = function(e1) {
+    message("reduction_method 参数失败，尝试 method='DDRTree'。原错误：", e1$message)
+    
+    mono_reduceDimension(
+      cds,
+      max_components = 2,
+      method = "DDRTree",
+      norm_method = "log",
+      pseudo_expr = 1,
+      verbose = TRUE
+    )
+  }
+)
+
+message("========== orderCells 默认排序 ==========")
+
+cds <- mono_orderCells(cds)
+
+plot_df <- get_reduced_df(cds) %>%
+  left_join(
+    as.data.frame(Biobase::pData(cds)) %>%
+      mutate(spot_id = rownames(.)),
+    by = "spot_id"
+  )
+
+plot_df$State <- as.factor(plot_df$State)
+
+edge_df <- extract_edge_df_from_cds_plot(cds)
+
+############################################################
+## 11. UCell 打分
+############################################################
+
+message("========== UCell 打分 ==========")
+
+expr_mat <- as(counts_traj, "dgCMatrix")
+rownames(expr_mat) <- clean_gene_key(rownames(expr_mat))
+expr_mat <- dedup_genes_keep_high_mean(expr_mat)
+
+expr_mat <- expr_mat[, plot_df$spot_id, drop = FALSE]
+
+module_list_ucell <- lapply(module_list_ordered, function(gs) {
+  gs <- unique(clean_gene_key(gs))
+  gs <- gs[!is.na(gs) & gs != ""]
+  gs
+})
+
+module_match_table <- bind_rows(lapply(names(module_list_ucell), function(mid) {
+  gs <- module_list_ucell[[mid]]
+  
+  data.frame(
+    display_id = mid,
+    display_label = module_labels_ordered[[mid]],
+    input_gene_key = gs,
+    matched = gs %in% rownames(expr_mat),
+    stringsAsFactors = FALSE
+  )
+}))
+
+module_match_summary <- module_match_table %>%
+  group_by(display_id, display_label) %>%
+  summarise(
+    n_input_genes = n(),
+    n_matched_genes = sum(matched),
+    n_missing_genes = sum(!matched),
+    matched_genes = paste(input_gene_key[matched], collapse = ";"),
+    missing_genes = paste(input_gene_key[!matched], collapse = ";"),
+    match_rate = n_matched_genes / n_input_genes,
+    .groups = "drop"
+  ) %>%
+  left_join(
+    MODULE_DISPLAY_SPEC_OK %>% select(display_id, display_order),
+    by = "display_id"
+  ) %>%
+  arrange(display_order)
+
+write.csv(module_match_table, file.path(DIR_TAB, "11_UCell_gene_match_table.csv"), row.names = FALSE)
+write.csv(module_match_summary, file.path(DIR_TAB, "12_UCell_gene_match_summary.csv"), row.names = FALSE)
+
+ucell_score_raw <- tryCatch(
+  {
+    UCell::ScoreSignatures_UCell(
+      matrix = expr_mat,
+      features = module_list_ucell,
+      maxRank = UCELL_MAX_RANK,
+      ncores = UCELL_NCORES
+    )
+  },
+  error = function(e1) {
+    message("命名参数 matrix= 调用失败，改用位置参数。原错误：", e1$message)
+    
+    UCell::ScoreSignatures_UCell(
+      expr_mat,
+      features = module_list_ucell,
+      maxRank = UCELL_MAX_RANK,
+      ncores = UCELL_NCORES
+    )
+  }
+)
+
+ucell_df <- as.data.frame(ucell_score_raw)
+
+if (nrow(ucell_df) == ncol(expr_mat)) {
+  ucell_df$spot_id <- rownames(ucell_df)
+} else if (ncol(ucell_df) == ncol(expr_mat)) {
+  ucell_df <- as.data.frame(t(as.matrix(ucell_df)))
+  ucell_df$spot_id <- rownames(ucell_df)
+} else {
+  stop("无法识别 UCell 返回矩阵维度：", nrow(ucell_df), " x ", ncol(ucell_df))
+}
+
+ucell_df <- ucell_df[match(plot_df$spot_id, ucell_df$spot_id), , drop = FALSE]
+
+ucell_score_cols <- setdiff(colnames(ucell_df), "spot_id")
+
+ucell_score_df <- data.frame(
+  spot_id = plot_df$spot_id,
+  stringsAsFactors = FALSE
+)
+
+ucell_col_map <- data.frame()
+
+for (i in seq_along(names(module_list_ucell))) {
+  mid <- names(module_list_ucell)[i]
+  
+  possible_cols <- c(
+    mid,
+    paste0(mid, "_UCell"),
+    make.names(mid),
+    paste0(make.names(mid), "_UCell")
+  )
+  
+  hit_col <- possible_cols[possible_cols %in% colnames(ucell_df)][1]
+  
+  if (is.na(hit_col) || length(hit_col) == 0) {
+    hit_col <- ucell_score_cols[i]
+    warning("模块 ", mid, " 未按名字匹配到 UCell 列，按顺序使用：", hit_col)
+  }
+  
+  raw_score <- as.numeric(ucell_df[[hit_col]])
+  
+  raw_col <- paste0(mid, "__UCell")
+  z_col <- paste0(mid, "__UCell_z")
+  
+  ucell_score_df[[raw_col]] <- raw_score
+  ucell_score_df[[z_col]] <- safe_z(raw_score)
+  
+  plot_df[[raw_col]] <- ucell_score_df[[raw_col]]
+  plot_df[[z_col]] <- ucell_score_df[[z_col]]
+  
+  ucell_col_map <- bind_rows(
+    ucell_col_map,
+    data.frame(
+      display_order = MODULE_DISPLAY_SPEC_OK$display_order[MODULE_DISPLAY_SPEC_OK$display_id == mid],
+      display_id = mid,
+      display_label = module_labels_ordered[[mid]],
+      original_module_id = MODULE_DISPLAY_SPEC_OK$original_module_id[MODULE_DISPLAY_SPEC_OK$display_id == mid],
+      original_module_label = MODULE_DISPLAY_SPEC_OK$original_module_label[MODULE_DISPLAY_SPEC_OK$display_id == mid],
+      ucell_return_col = hit_col,
+      raw_col = raw_col,
+      z_col = z_col,
+      stringsAsFactors = FALSE
+    )
+  )
+}
+
+ucell_col_map <- ucell_col_map %>%
+  arrange(display_order)
+
+write.csv(ucell_col_map, file.path(DIR_TAB, "13_UCell_column_mapping.csv"), row.names = FALSE)
+write.csv(ucell_score_df, file.path(DIR_TAB, "14_UCell_score_by_spot.csv"), row.names = FALSE)
+
+############################################################
+## 12. CAF 方向校正
+############################################################
+
+advanced_ids <- grep(
+  "ECM|SASP|senescence|senescent|derived_ECM|derived_SASP",
+  names(module_list_ucell),
+  ignore.case = TRUE,
+  value = TRUE
+)
+
+early_ids <- grep(
+  "presenescence|no_senescence|non_senescence|iCAF|apCAF|other",
+  names(module_list_ucell),
+  ignore.case = TRUE,
+  value = TRUE
+)
+
+advanced_z_cols <- paste0(advanced_ids, "__UCell_z")
+advanced_z_cols <- advanced_z_cols[advanced_z_cols %in% colnames(plot_df)]
+
+early_z_cols <- paste0(early_ids, "__UCell_z")
+early_z_cols <- early_z_cols[early_z_cols %in% colnames(plot_df)]
+
+plot_df$CAF_advanced_UCell_axis <- if (length(advanced_z_cols) > 0) {
+  rowMeans(as.matrix(plot_df[, advanced_z_cols, drop = FALSE]), na.rm = TRUE)
+} else {
+  plot_df$COL1A1_score_z
+}
+
+plot_df$CAF_early_UCell_axis <- if (length(early_z_cols) > 0) {
+  rowMeans(as.matrix(plot_df[, early_z_cols, drop = FALSE]), na.rm = TRUE)
+} else {
+  0
+}
+
+plot_df$CAF_progression_axis <- safe_z(plot_df$CAF_advanced_UCell_axis) -
+  0.20 * safe_z(plot_df$CAF_early_UCell_axis) +
+  0.20 * safe_z(plot_df$COL1A1_score_z)
+
+cor_raw_progression <- suppressWarnings(
+  cor(
+    plot_df$Pseudotime,
+    plot_df$CAF_progression_axis,
+    method = "spearman",
+    use = "complete.obs"
+  )
+)
+
+if (is.finite(cor_raw_progression) && cor_raw_progression < 0) {
+  plot_df$Pseudotime_final <- max(plot_df$Pseudotime, na.rm = TRUE) - plot_df$Pseudotime
+  pseudotime_direction_method <- "reversed_by_CAF_progression_axis"
+} else {
+  plot_df$Pseudotime_final <- plot_df$Pseudotime
+  pseudotime_direction_method <- "default_monocle_direction_kept"
+}
+
+plot_df$Pseudotime_0_1 <- minmax_01(plot_df$Pseudotime_final)
+plot_df$pseudotime_direction_method <- pseudotime_direction_method
+
+write.csv(plot_df, file.path(DIR_TAB, "15_plot_df_COL1A1_CAF_trajectory_with_UCell_scores.csv"), row.names = FALSE)
+write.csv(edge_df, file.path(DIR_TAB, "16_monocle2_edge_segments.csv"), row.names = FALSE)
+
+############################################################
+## 13. 整体拟时序图 + Cluster state 色块图
+############################################################
+
+xlim_use <- range(plot_df$Component_1, na.rm = TRUE)
+ylim_use <- range(plot_df$Component_2, na.rm = TRUE)
+
+plot_pseudotime_big <- function(df) {
+  p <- ggplot(df, aes(Component_1, Component_2)) +
+    geom_point(
+      aes(color = Pseudotime_0_1),
+      size = 0.75,
+      alpha = 0.95
+    ) +
+    scale_color_gradientn(
+      colors = PSEUDOTIME_COLORS_B,
+      values = PSEUDOTIME_VALUES_B,
+      limits = c(0, 1),
+      oob = scales::squish,
+      name = "Pseudotime\n0-1"
+    ) +
+    coord_cartesian(xlim = xlim_use, ylim = ylim_use) +
+    theme_mono_panel(base_size = 14) +
+    labs(
+      title = "Pseudotime trajectory",
+      x = NULL,
+      y = NULL
+    )
+  
+  add_edge_layer(p, edge_df)
+}
+
+plot_state_big <- function(df) {
+  state_levels <- levels(as.factor(df$State))
+  state_cols <- scales::hue_pal()(length(state_levels))
+  names(state_cols) <- state_levels
+  
+  p <- ggplot(df, aes(Component_1, Component_2)) +
+    geom_point(
+      aes(color = State),
+      size = 0.75,
+      alpha = 0.95
+    ) +
+    scale_color_manual(values = state_cols, name = "State") +
+    coord_cartesian(xlim = xlim_use, ylim = ylim_use) +
+    theme_mono_panel(base_size = 14) +
+    labs(
+      title = "Cluster state",
+      x = NULL,
+      y = NULL
+    )
+  
+  add_edge_layer(p, edge_df)
+}
+
+p_pt_big <- plot_pseudotime_big(plot_df)
+p_state_big <- plot_state_big(plot_df)
+
+fig_overall_reference <- p_pt_big | p_state_big
+
+save_pdf_png(
+  fig_overall_reference,
+  "Figure_01_overall_pseudotime_and_cluster_state_reference_style",
+  width = 16,
+  height = 6.2,
+  outdir = DIR_OVERALL
+)
+
+save_pdf_png(
+  p_pt_big,
+  "Figure_01A_overall_pseudotime_trajectory",
+  width = 7.5,
+  height = 6.2,
+  outdir = DIR_OVERALL
+)
+
+save_pdf_png(
+  p_state_big,
+  "Figure_01B_cluster_state_blocks",
+  width = 7.5,
+  height = 6.2,
+  outdir = DIR_OVERALL
+)
+
+############################################################
+## 14. 模块轨迹图
+############################################################
+
+plot_ucell_module <- function(mid) {
+  z_col <- paste0(mid, "__UCell_z")
+  lab <- module_labels_ordered[[mid]]
+  
+  fg <- plot_df %>%
+    filter(is.finite(.data[[z_col]]))
+  
+  z_use <- fg[[z_col]]
+  lim <- suppressWarnings(quantile(abs(z_use), 0.98, na.rm = TRUE))
+  
+  if (!is.finite(lim) || lim <= 0) lim <- 1
+  lim <- max(1, min(CLIP_MODULE_Z, lim))
+  
+  n_match <- module_match_summary$n_matched_genes[module_match_summary$display_id == mid]
+  n_input <- module_match_summary$n_input_genes[module_match_summary$display_id == mid]
+  
+  p <- ggplot() +
+    geom_point(
+      data = plot_df,
+      aes(Component_1, Component_2),
+      color = BACKGROUND_GREY,
+      size = POINT_SIZE,
+      alpha = 0.55
+    ) +
+    geom_point(
+      data = fg,
+      aes(Component_1, Component_2, color = .data[[z_col]]),
+      size = POINT_SIZE,
+      alpha = POINT_ALPHA
+    ) +
+    scale_color_gradient2(
+      low = MODULE_LOW,
+      mid = MODULE_MID,
+      high = MODULE_HIGH,
+      midpoint = 0,
+      limits = c(-lim, lim),
+      oob = scales::squish,
+      na.value = BACKGROUND_GREY,
+      name = "UCell\nz-score"
+    ) +
+    coord_cartesian(xlim = xlim_use, ylim = ylim_use) +
+    theme_mono_axis(base_size = 9) +
+    labs(
+      title = lab,
+      subtitle = paste0("Matched genes: ", n_match, " / ", n_input),
+      x = "Component 1",
+      y = "Component 2"
+    )
+  
+  add_edge_layer(p, edge_df)
+}
+
+module_plots <- list()
+
+for (mid in MODULE_DISPLAY_SPEC_OK$display_id) {
+  p <- plot_ucell_module(mid)
+  module_plots[[mid]] <- p
+  
+  save_pdf_png(
+    p,
+    paste0(
+      "UCell_ModuleTrajectory_",
+      sprintf("%02d", MODULE_DISPLAY_SPEC_OK$display_order[MODULE_DISPLAY_SPEC_OK$display_id == mid]),
+      "_",
+      mid
+    ),
+    width = 6.2,
+    height = 4.8,
+    outdir = DIR_TRAJ
+  )
+}
+
+module_ids <- MODULE_DISPLAY_SPEC_OK$display_id
+chunks <- split(module_ids, ceiling(seq_along(module_ids) / 12))
+
+for (i in seq_along(chunks)) {
+  ids <- chunks[[i]]
+  
+  fig <- patchwork::wrap_plots(module_plots[ids], ncol = 4) +
+    patchwork::plot_annotation(
+      title = paste0("UCell marker module scores on COL1A1 CAF pseudotime - page ", i),
+      subtitle = "Panel order follows the reference board; extra modules are appended",
+      theme = theme(
+        plot.title = element_text(face = "bold", size = 20, color = "black"),
+        plot.subtitle = element_text(size = 12, color = "grey30")
+      )
+    )
+  
+  save_pdf_png(
+    fig,
+    paste0("Figure_02_UCell_module_trajectory_board_page_", sprintf("%02d", i)),
+    width = 22,
+    height = 15,
+    outdir = DIR_COMP
+  )
+}
+
+############################################################
+## 15. 无散点折线趋势图
+############################################################
+
+plot_df$pseudotime_bin <- cut(
+  plot_df$Pseudotime_0_1,
+  breaks = seq(0, 1, length.out = N_PSEUDOTIME_BINS + 1),
+  include.lowest = TRUE,
+  labels = FALSE
+)
+
+long_ucell_df <- lapply(seq_len(nrow(MODULE_DISPLAY_SPEC_OK)), function(i) {
+  mid <- MODULE_DISPLAY_SPEC_OK$display_id[i]
+  z_col <- paste0(mid, "__UCell_z")
+  raw_col <- paste0(mid, "__UCell")
+  
+  data.frame(
+    spot_id = plot_df$spot_id,
+    Pseudotime_0_1 = plot_df$Pseudotime_0_1,
+    pseudotime_bin = plot_df$pseudotime_bin,
+    State = plot_df$State,
+    display_order = MODULE_DISPLAY_SPEC_OK$display_order[i],
+    display_id = mid,
+    display_label = MODULE_DISPLAY_SPEC_OK$display_label[i],
+    UCell_score = plot_df[[raw_col]],
+    UCell_z = plot_df[[z_col]],
+    stringsAsFactors = FALSE
+  )
+}) %>%
+  bind_rows()
+
+trend_bin_df <- long_ucell_df %>%
+  filter(
+    is.finite(Pseudotime_0_1),
+    is.finite(UCell_z),
+    !is.na(pseudotime_bin)
+  ) %>%
+  group_by(display_order, display_id, display_label, pseudotime_bin) %>%
+  summarise(
+    n_spots = n(),
+    pseudotime_mean = mean(Pseudotime_0_1, na.rm = TRUE),
+    UCell_mean = mean(UCell_score, na.rm = TRUE),
+    UCell_z_mean = mean(UCell_z, na.rm = TRUE),
+    UCell_z_median = median(UCell_z, na.rm = TRUE),
+    UCell_z_sd = sd(UCell_z, na.rm = TRUE),
+    UCell_z_se = UCell_z_sd / sqrt(n_spots),
+    .groups = "drop"
+  ) %>%
+  arrange(display_order, pseudotime_bin)
+
+cor_df <- lapply(seq_len(nrow(MODULE_DISPLAY_SPEC_OK)), function(i) {
+  mid <- MODULE_DISPLAY_SPEC_OK$display_id[i]
+  lab <- MODULE_DISPLAY_SPEC_OK$display_label[i]
+  z_col <- paste0(mid, "__UCell_z")
+  
+  x <- plot_df$Pseudotime_0_1
+  y <- plot_df[[z_col]]
+  
+  ok <- is.finite(x) & is.finite(y)
+  
+  if (sum(ok) < 10) {
+    return(
+      data.frame(
+        display_order = MODULE_DISPLAY_SPEC_OK$display_order[i],
+        display_id = mid,
+        display_label = lab,
+        n_spots = sum(ok),
+        spearman_rho = NA_real_,
+        spearman_p = NA_real_,
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+  
+  sp <- suppressWarnings(cor.test(x[ok], y[ok], method = "spearman", exact = FALSE))
+  
+  data.frame(
+    display_order = MODULE_DISPLAY_SPEC_OK$display_order[i],
+    display_id = mid,
+    display_label = lab,
+    n_spots = sum(ok),
+    spearman_rho = as.numeric(sp$estimate),
+    spearman_p = sp$p.value,
+    stringsAsFactors = FALSE
+  )
+}) %>%
+  bind_rows() %>%
+  mutate(
+    spearman_FDR = p.adjust(spearman_p, method = "BH"),
+    trend_direction = case_when(
+      is.na(spearman_rho) ~ "NA",
+      spearman_rho > 0 ~ "increase_along_pseudotime",
+      spearman_rho < 0 ~ "decrease_along_pseudotime",
+      TRUE ~ "flat"
+    )
+  ) %>%
+  arrange(display_order)
+
+write.csv(long_ucell_df, file.path(DIR_TAB, "17_UCell_long_by_spot.csv"), row.names = FALSE)
+write.csv(trend_bin_df, file.path(DIR_TAB, "18_UCell_pseudotime_bin_trend.csv"), row.names = FALSE)
+write.csv(cor_df, file.path(DIR_TAB, "19_UCell_vs_pseudotime_correlation.csv"), row.names = FALSE)
+
+plot_one_trend_no_points <- function(display_id_use) {
+  dd_bin <- trend_bin_df %>%
+    filter(display_id == display_id_use)
+  
+  lab <- MODULE_DISPLAY_SPEC_OK$display_label[
+    MODULE_DISPLAY_SPEC_OK$display_id == display_id_use
+  ]
+  
+  rho <- cor_df$spearman_rho[cor_df$display_id == display_id_use]
+  fdr <- cor_df$spearman_FDR[cor_df$display_id == display_id_use]
+  
+  subtitle_txt <- paste0(
+    "Spearman rho = ",
+    ifelse(is.finite(rho), round(rho, 3), "NA"),
+    "; FDR = ",
+    ifelse(is.finite(fdr), signif(fdr, 3), "NA")
+  )
+  
+  ggplot(dd_bin, aes(x = pseudotime_mean, y = UCell_z_mean)) +
+    geom_ribbon(
+      aes(
+        ymin = UCell_z_mean - UCell_z_se,
+        ymax = UCell_z_mean + UCell_z_se
+      ),
+      alpha = 0.22,
+      fill = MODULE_HIGH
+    ) +
+    geom_line(
+      linewidth = 1.15,
+      color = MODULE_HIGH
+    ) +
+    geom_hline(
+      yintercept = 0,
+      linetype = "dashed",
+      linewidth = 0.35,
+      color = "grey40"
+    ) +
+    coord_cartesian(xlim = c(0, 1)) +
+    theme_trend(base_size = 11) +
+    labs(
+      title = lab,
+      subtitle = subtitle_txt,
+      x = "COL1A1 CAF pseudotime 0-1",
+      y = "UCell z-score"
+    )
+}
+
+trend_plots <- list()
+
+for (mid in MODULE_DISPLAY_SPEC_OK$display_id) {
+  p <- plot_one_trend_no_points(mid)
+  trend_plots[[mid]] <- p
+  
+  save_pdf_png(
+    p,
+    paste0(
+      "Trend_no_points_",
+      sprintf("%02d", MODULE_DISPLAY_SPEC_OK$display_order[MODULE_DISPLAY_SPEC_OK$display_id == mid]),
+      "_",
+      mid
+    ),
+    width = 6.4,
+    height = 4.8,
+    outdir = DIR_TREND
+  )
+}
+
+trend_ids <- MODULE_DISPLAY_SPEC_OK$display_id
+trend_chunks <- split(trend_ids, ceiling(seq_along(trend_ids) / 12))
+
+for (i in seq_along(trend_chunks)) {
+  ids <- trend_chunks[[i]]
+  
+  fig <- patchwork::wrap_plots(trend_plots[ids], ncol = 4) +
+    patchwork::plot_annotation(
+      title = paste0("UCell marker module dynamics along COL1A1 CAF pseudotime - page ", i),
+      subtitle = "No grey scatter points; panel order follows the reference board",
+      theme = theme(
+        plot.title = element_text(face = "bold", size = 20, color = "black"),
+        plot.subtitle = element_text(size = 12, color = "grey30")
+      )
+    )
+  
+  save_pdf_png(
+    fig,
+    paste0("Figure_03_UCell_trend_no_points_board_page_", sprintf("%02d", i)),
+    width = 22,
+    height = 14,
+    outdir = DIR_COMP
+  )
+}
+
+############################################################
+## 16. 热图：按 display order
+############################################################
+
+heat_df <- trend_bin_df %>%
+  mutate(
+    score_clip = pmax(pmin(UCell_z_mean, CLIP_MODULE_Z), -CLIP_MODULE_Z),
+    display_label_order = factor(
+      display_label,
+      levels = rev(MODULE_DISPLAY_SPEC_OK$display_label)
+    )
+  )
+
+p_heat <- ggplot(
+  heat_df,
+  aes(
+    x = pseudotime_bin,
+    y = display_label_order,
+    fill = score_clip
+  )
+) +
+  geom_tile() +
+  scale_fill_gradient2(
+    low = MODULE_LOW,
+    mid = MODULE_MID,
+    high = MODULE_HIGH,
+    midpoint = 0,
+    limits = c(-CLIP_MODULE_Z, CLIP_MODULE_Z),
+    oob = scales::squish,
+    na.value = BACKGROUND_GREY,
+    name = "Mean UCell\nz-score"
+  ) +
+  scale_x_continuous(
+    breaks = seq(0, N_PSEUDOTIME_BINS, by = 10),
+    labels = round(seq(0, 1, length.out = length(seq(0, N_PSEUDOTIME_BINS, by = 10))), 2),
+    expand = c(0, 0)
+  ) +
+  theme_heat(base_size = 10) +
+  labs(
+    title = "UCell marker module evolution along COL1A1 CAF pseudotime",
+    subtitle = "Rows follow final panel order",
+    x = "COL1A1 CAF pseudotime 0-1",
+    y = NULL
+  )
+
+save_pdf_png(
+  p_heat,
+  "Figure_04_UCell_module_pseudotime_heatmap_display_order",
+  width = 12,
+  height = max(5.5, 0.35 * nrow(MODULE_DISPLAY_SPEC_OK) + 2),
+  outdir = DIR_HEAT
+)
+
+############################################################
+## 17. 保存
+############################################################
+
+state_summary <- plot_df %>%
+  group_by(State) %>%
+  summarise(
+    n_spots = n(),
+    mean_pseudotime = mean(Pseudotime_0_1, na.rm = TRUE),
+    median_pseudotime = median(Pseudotime_0_1, na.rm = TRUE),
+    mean_COL1A1_score_z = mean(COL1A1_score_z, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(mean_pseudotime)
+
+state_section_summary <- plot_df %>%
+  count(State, sample_short, name = "n_spots") %>%
+  group_by(State) %>%
+  mutate(percent_in_state = n_spots / sum(n_spots) * 100) %>%
+  ungroup()
+
+write.csv(state_summary, file.path(DIR_TAB, "20_state_summary.csv"), row.names = FALSE)
+write.csv(state_section_summary, file.path(DIR_TAB, "21_state_section_distribution.csv"), row.names = FALSE)
+
+summary_df <- data.frame(
+  item = c(
+    "L_OUTS",
+    "R_OUTS",
+    "marker_file",
+    "output_dir",
+    "n_raw_spots",
+    "n_basic_QC_spots",
+    "n_COL1A1_CAF_spots",
+    "CAF_marker_used",
+    "CAF_marker_matched",
+    "COL1A1_SCORE_KEEP_Q",
+    "COL1A1_score_cut",
+    "n_ordering_genes",
+    "pseudotime_direction_method",
+    "cor_raw_pseudotime_vs_CAF_progression_axis",
+    "UCell_maxRank",
+    "UCell_ncores",
+    "module_order_rule"
+  ),
+  value = c(
+    L_OUTS,
+    R_OUTS,
+    MARKER_FILE,
+    OUTDIR,
+    ncol(counts_all),
+    nrow(meta_qc),
+    nrow(meta_caf),
+    paste(CAF_CLASSIC_MARKERS, collapse = ";"),
+    paste(caf_marker_hit, collapse = ";"),
+    COL1A1_SCORE_KEEP_Q,
+    col1a1_score_cut,
+    length(ordering_genes),
+    pseudotime_direction_method,
+    cor_raw_progression,
+    UCELL_MAX_RANK,
+    UCELL_NCORES,
+    "First 12 panels follow user reference image; extra modules appended"
+  ),
+  stringsAsFactors = FALSE
+)
+
+write.csv(summary_df, file.path(DIR_TAB, "99_COL1A1_single_CAF_pseudotime_summary.csv"), row.names = FALSE)
+
+openxlsx::write.xlsx(
+  list(
+    summary = summary_df,
+    qc_summary = qc_summary,
+    module_order = MODULE_DISPLAY_SPEC,
+    module_order_ok = MODULE_DISPLAY_SPEC_OK,
+    marker_modules = module_meta_all,
+    match_sum = module_match_summary,
+    match_table = module_match_table,
+    UCell_map = ucell_col_map,
+    UCell_score = ucell_score_df,
+    long_score = long_ucell_df,
+    trend_bin = trend_bin_df,
+    pseudo_cor = cor_df,
+    state_sum = state_summary,
+    state_section = state_section_summary,
+    ordering_genes = data.frame(ordering_gene = ordering_genes)
+  ),
+  file.path(DIR_XLSX, "COL1A1_single_CAF_pseudotime_UCell_all_tables.xlsx"),
+  overwrite = TRUE
+)
+
+saveRDS(
+  list(
+    cds = cds,
+    plot_df = plot_df,
+    edge_df = edge_df,
+    counts_traj = counts_traj,
+    expr_mat = expr_mat,
+    meta_raw = meta,
+    meta_qc = meta_qc,
+    meta_caf = meta_caf,
+    module_display_spec = MODULE_DISPLAY_SPEC,
+    module_display_spec_ok = MODULE_DISPLAY_SPEC_OK,
+    module_list_ordered = module_list_ucell,
+    module_match_table = module_match_table,
+    module_match_summary = module_match_summary,
+    UCell_raw_return = ucell_score_raw,
+    UCell_score_df = ucell_score_df,
+    UCell_column_mapping = ucell_col_map,
+    long_ucell_df = long_ucell_df,
+    trend_bin_df = trend_bin_df,
+    cor_df = cor_df,
+    state_summary = state_summary,
+    state_section_summary = state_section_summary,
+    ordering_genes = ordering_genes,
+    ordering_tbl = ordering_tbl,
+    summary = summary_df
+  ),
+  file.path(DIR_RDS, "01_COL1A1_single_CAF_Monocle2_UCell_result.rds")
+)
+
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(OUTDIR, "sessionInfo_COL1A1_single_CAF_Monocle2_UCell.txt")
+)
+
+message("============================================================")
+message("完成：COL1A1 单基因 CAF 拟时序 + UCell 打分")
+message("输出目录：", OUTDIR)
+message("整体拟时序+State图：", file.path(DIR_OVERALL, "Figure_01_overall_pseudotime_and_cluster_state_reference_style.png"))
+message("拟时序单图：", file.path(DIR_OVERALL, "Figure_01A_overall_pseudotime_trajectory.png"))
+message("Cluster state色块图：", file.path(DIR_OVERALL, "Figure_01B_cluster_state_blocks.png"))
+message("模块轨迹组图：", file.path(DIR_COMP, "Figure_02_UCell_module_trajectory_board_page_01.png"))
+message("折线趋势组图：", file.path(DIR_COMP, "Figure_03_UCell_trend_no_points_board_page_01.png"))
+message("热图：", file.path(DIR_HEAT, "Figure_04_UCell_module_pseudotime_heatmap_display_order.png"))
+message("Excel汇总：", file.path(DIR_XLSX, "COL1A1_single_CAF_pseudotime_UCell_all_tables.xlsx"))
+message("RDS：", file.path(DIR_RDS, "01_COL1A1_single_CAF_Monocle2_UCell_result.rds"))
+message("============================================================")
